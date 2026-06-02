@@ -5,7 +5,9 @@ The JUCE app connects over a local socket and speaks one framed protocol:
 
   frame = [4-byte big-endian length][1-byte type][payload]
     type 0x01 CONTROL (client->server, JSON utf8)
-    type 0x02 AUDIO   (server->client, float32 interleaved stereo PCM @ 48k)
+    type 0x02 AUDIO   (server->client, float32 interleaved 4ch PCM @ 48k:
+                       [coverL,coverR, origL,origR] — the client picks a pair so
+                       it can A/B the cover vs the original source instantly)
     type 0x03 EVENT   (server->client, JSON utf8: ready / stats / error)
 
 CONTROL commands (JSON):
@@ -14,7 +16,8 @@ CONTROL commands (JSON):
   {"cmd":"prompt","tags":"..."}     {"cmd":"denoise","value":0.7}
   {"cmd":"dcw","value":true}        # wavelet-domain correction on/off (live)
   {"cmd":"seek","value":0.5}        # jump to a fractional position (0..1)
-  {"cmd":"play"}                    {"cmd":"stop"}
+  {"cmd":"enhance","tags":"..."}    # rewrite a short style into a rich caption (5Hz LM) -> "enhanced" event
+  {"cmd":"play"}  {"cmd":"pause"}   {"cmd":"stop"}   # play/resume · pause (keep pos) · stop (reset to 0)
 
 The audio sender paces at 1x; the client buffers into its own jitter ring and
 drains from the audio callback. Single client (the plugin).
@@ -76,6 +79,9 @@ class Connection:
         self.playing = False
         self.alive = True
         self._loaded = False
+        self.enhancer = None              # prompt-LM subprocess (lazy)
+        self._enh_lock = threading.Lock()
+        self._stats_on = False            # one stats loop per producer run
 
     def handle(self):
         threading.Thread(target=self._sender, daemon=True).start()
@@ -97,11 +103,15 @@ class Connection:
             pass
 
     def _stats_loop(self):
-        """Push engine telemetry (buffer / regens / playhead) ~5 Hz for the meter."""
-        while self.alive and self.playing and self.rc is not None:
-            ev = self.rc.stats(); ev["event"] = "stats"
-            self._send_event(ev)
-            time.sleep(0.1)
+        """Push engine telemetry (buffer / regens / playhead) ~10 Hz while the producer
+        runs (play AND pause — so the paused playhead stays visible). Exits on stop."""
+        try:
+            while self.alive and self.rc is not None and self.rc.running:
+                ev = self.rc.stats(); ev["event"] = "stats"
+                self._send_event(ev)
+                time.sleep(0.1)
+        finally:
+            self._stats_on = False
 
     def _download_with_progress(self, repo, local_dir, allow_patterns, target_bytes, label):
         """snapshot_download with a dir-size progress monitor -> download_progress EVENTs."""
@@ -138,6 +148,50 @@ class Connection:
             if not (xl.is_dir() and any(xl.iterdir())):
                 self._download_with_progress("ACE-Step/acestep-v15-xl-turbo", xl, None, 20.0e9, "Quality model (XL, 20 GB)")
 
+    # ---- prompt enhancer (5Hz LM in a separate process; see sidecar/enhancer.py) ----
+    LM_NAME = "acestep-5Hz-lm-0.6B"
+
+    def _ensure_lm(self):
+        from acestep.paths import checkpoints_dir
+        d = checkpoints_dir() / self.LM_NAME
+        if not (d.is_dir() and any(d.iterdir())):
+            self._download_with_progress(f"ACE-Step/{self.LM_NAME}", d, None, 1.25e9, "prompt LM (0.6B)")
+
+    def _spawn_enhancer(self):
+        if self.enhancer is not None and self.enhancer.poll() is None:
+            return
+        import subprocess
+        from acestep.paths import checkpoints_dir
+        enh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "enhancer.py")
+        env = dict(os.environ, PYTORCH_ENABLE_MPS_FALLBACK="1",
+                   ACE15_CKPT=str(checkpoints_dir()),
+                   ACE15_ACESTEP15=os.environ.get("ACE15_ACESTEP15", "/Users/max/Code/ACE-Step-1.5"),
+                   ACE15_LM=self.LM_NAME)
+        self.enhancer = subprocess.Popen([sys.executable, enh], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
+
+    def _do_enhance(self, caption):
+        """Off the control thread: download the LM if needed, run format_sample in the
+        enhancer subprocess, emit the enhanced caption (or an error)."""
+        try:
+            if not (caption or "").strip():
+                return
+            self._ensure_lm()
+            self._send_event({"event": "enhancing"})   # first run also loads the model (~10-20s)
+            with self._enh_lock:
+                self._spawn_enhancer()
+                self.enhancer.stdin.write(json.dumps({"caption": caption}) + "\n")
+                self.enhancer.stdin.flush()
+                resp = self.enhancer.stdout.readline()
+            out = json.loads(resp) if resp.strip() else {"ok": False, "error": "no response"}
+            if out.get("ok"):
+                self._send_event({"event": "enhanced", "caption": out["caption"]})
+            else:
+                self._send_event({"event": "error", "cmd": "enhance", "msg": out.get("error", "enhance failed")})
+        except Exception as e:
+            self.enhancer = None   # force respawn next time
+            self._send_event({"event": "error", "cmd": "enhance", "msg": str(e)})
+
     def _on_control(self, msg):
         cmd = msg.get("cmd")
         try:
@@ -172,6 +226,10 @@ class Connection:
                 self._loaded = True
                 self._send_event({"event": "loaded", "duration": self.rc.full_T / 25.0,
                                   "peaks": self.rc.peaks(), "model": model})
+            elif cmd == "enhance":
+                # prompt enhancer — independent of the cover engine, so handled before
+                # the rc-None guard (works with no track loaded). Runs off-thread.
+                threading.Thread(target=self._do_enhance, args=(msg.get("tags", ""),), daemon=True).start()
             elif self.rc is None:
                 return   # no track loaded yet — control commands no-op (UI re-sends state on load)
             elif cmd == "style":
@@ -179,13 +237,22 @@ class Connection:
                     self.rc.jit.set_dcw(enabled=bool(msg["dcw"]))
                 self.rc.set_style(msg["tags"], denoise=msg.get("denoise", 0.8),
                                   character=msg.get("character", 0.0),
-                                  send_bpm=msg.get("send_bpm", True), send_key=msg.get("send_key", True))
+                                  send_bpm=msg.get("send_bpm", True), send_key=msg.get("send_key", True),
+                                  bpm=msg.get("bpm"), key=msg.get("key"))
                 self._send_event({"event": "styled", "bpm": self.rc.jit.bpm, "key": self.rc.jit.key})
             elif cmd == "play":
-                if not self.playing and self.rc is not None:
-                    self.rc.start(); self.playing = True
+                # play (from stopped) or resume (from paused). PAUSE keeps the producer
+                # running, so resume is just turning the sender back on.
+                if not self.rc.running:
+                    self.rc.start()                  # fresh from the start
+                self.playing = True
+                if not self._stats_on:
+                    self._stats_on = True
                     threading.Thread(target=self._stats_loop, daemon=True).start()
-                    self._send_event({"event": "playing"})
+                self._send_event({"event": "playing"})
+            elif cmd == "pause":
+                self.playing = False                 # stop the sender; keep producer + position
+                self._send_event({"event": "paused"})
             elif cmd == "prompt":
                 self.rc.set_prompt(msg["tags"])
             elif cmd == "denoise":
@@ -193,7 +260,8 @@ class Connection:
             elif cmd == "character":
                 self.rc.set_character(msg["value"])
             elif cmd == "metas":
-                self.rc.set_metas(send_bpm=msg.get("send_bpm"), send_key=msg.get("send_key"))
+                self.rc.set_metas(send_bpm=msg.get("send_bpm"), send_key=msg.get("send_key"),
+                                  bpm=msg.get("bpm"), key=msg.get("key"))
             elif cmd == "evolve":
                 self.rc.set_evolve(bool(msg["value"]))
             elif cmd == "dcw":
@@ -201,12 +269,13 @@ class Connection:
             elif cmd == "seek":
                 self.rc.seek(float(msg["value"]))   # value = fractional position 0..1
             elif cmd == "reconfigure":
-                if self.rc and self.playing:
+                if self.rc and self.rc.running:
                     self.rc.reconfigure(steps=msg.get("steps"), window_s=msg.get("window"))
             elif cmd == "stop":
-                self.playing = False
+                self.playing = False                 # full stop: stop producer + reset to 0
                 if self.rc:
-                    self.rc.stop()
+                    self.rc.reset()
+                self._send_event({"event": "stopped"})
         except Exception as e:
             _send_json(self.sock, T_EVENT, {"event": "error", "cmd": cmd, "msg": str(e)})
 
@@ -241,6 +310,11 @@ class Connection:
         try:
             if self.rc:
                 self.rc.close()
+        except Exception:
+            pass
+        try:
+            if self.enhancer and self.enhancer.poll() is None:
+                self.enhancer.kill()
         except Exception:
             pass
         try:

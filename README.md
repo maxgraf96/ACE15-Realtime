@@ -55,10 +55,13 @@ denoise step. Structure (from `context_latents`) and style (from text cross-atte
 are independent dials. Per-tick hot path = **one DiT forward + windowed VAE decode**;
 everything else (encode source, extract hints, encode text) is per-load.
 
-**Real-time architecture (JIT):** with ~10× compute headroom we keep a tiny lookahead
-(~1 s) and regenerate the playhead window the instant a control changes — full control
-at full-decode quality. A background producer thread fills a PCM ring; the audio
-callback drains it (so the audio thread never blocks on the model).
+**Real-time architecture (pinned-prefix rolling):** a background producer keeps one
+**continuous latent** and extends it in chunks — each chunk's prefix is *pinned*
+(latent-domain inpainting) to the already-generated tail, so the model denoises the
+new frames to *continue* the real past. The overlap is identical → **no window seams**
+(this replaced an earlier windowed+crossfade scheme). The committed latent is decoded
+lazily (overlap-discard tiles, full VAE context) into a PCM ring that the audio
+callback drains. Control changes apply to new chunks (smooth, pinned transitions).
 
 ---
 
@@ -101,10 +104,11 @@ jumps to that position (the playhead follows; audio re-arrives within ~lookahead
 | Control | Effect |
 |---|---|
 | **Style** | Prompt (live). Style/instruments/timbre/era — comma-separated keywords. |
+| **Expand with LM** | Rewrites a short style ("tech house") into a rich, model-aligned caption via ACE-Step's 5Hz LM (`acestep-5Hz-lm-0.6B`), which lands far better than terse prompts. Runs in a separate process (the LM and DEMON can't share an interpreter); first use downloads ~1.2 GB. Result fills the Style box — edit freely. |
 | **Amount** | Structure ↔ style (denoise). **0 = the original source** (no restyle — handy for A/B); real songs usually want **~0.5–0.65**; tight loops tolerate higher. |
 | **Character** | 0 = full restyle · 1 = keep the source's own instrument/voice character. |
 | **Steps** | Diffusion steps (4–12). Fewer = snappier control; more = cleaner. Restarts on change. |
-| **Window** | Generation window seconds (bigger = more coherent, but a longer regen → more control latency, since the buffer auto-grows to stay glitch-free). Restarts on change. |
+| **Window** | Rolling generation window (s). The engine keeps a continuous latent and extends it in chunks whose prefix is *pinned* to the past (seamless — no window seams). Smaller (~8–10s) = snappier control + cheaper; larger (20s) = more context per chunk but laggier control. Restarts on change. |
 | **Match: Tempo / Key** | Inject the detected bpm/key into the prompt Metas. Turn Tempo off if BPM detection looks wrong. |
 | **Mode** | Coherent (fixed seed) ↔ Evolve (new variations as it loops). |
 | **Correction (DCW)** | Per-step wavelet-domain sampler correction ([`DCW`](https://arxiv.org/abs/2604.16044)). **Off by default** — in this turbo/few-step regime it runs the output hot (limiter saturation, harsh on dense material) for a marginal structure gain. Opt-in to experiment. ~1.3 ms/step on MPS, hot-applies on the next regen. |
@@ -148,6 +152,8 @@ engine/          MPS-first cover engine (Python)
 sidecar/
   server.py        local TCP server: framed CONTROL/AUDIO/EVENT, model select,
                    first-run model download with progress
+  enhancer.py      prompt-enhancer subprocess (ACE-Step-1.5 5Hz LM, format_sample) —
+                   separate process so its `acestep` pkg doesn't clash with DEMON's
   test_client.py   Python IPC client (protocol validation)
 app/             JUCE 8 standalone app
   CMakeLists.txt   FetchContent JUCE 8.0.4, Standalone target, BinaryData resources

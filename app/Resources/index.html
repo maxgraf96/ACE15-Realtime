@@ -13,9 +13,13 @@
         <h1>ACE15</h1>
         <span class="tag">Realtime cover</span>
       </div>
-      <div class="status" id="status">
-        <span class="dot"></span>
-        <span id="status-text">starting engine…</span>
+      <div class="top-right">
+        <button type="button" class="ab-toggle" id="ab-toggle" disabled
+                title="A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: Cover.">Cover</button>
+        <div class="status" id="status">
+          <span class="dot"></span>
+          <span id="status-text">starting engine…</span>
+        </div>
       </div>
     </header>
 
@@ -48,11 +52,28 @@
           <div class="srcname">
             <b id="srcname-text"></b>
             <span id="srcdur-text" class="srcdur"></span>
-            <span id="bpmkey" class="detected"></span>
+            <span class="meta-edit" id="meta-edit" hidden>
+              <input type="text" id="bpm-field" class="metafield" inputmode="numeric"
+                     title="Detected tempo — edit to correct it. Feeds the cover's Metas when Match › Tempo is on." />
+              <span class="metaunit">BPM</span>
+              <span class="metasep">·</span>
+              <input type="text" id="key-field" class="metafield keyfield"
+                     title="Detected key — edit to correct it. Feeds the cover's Metas when Match › Key is on." />
+            </span>
           </div>
           <div class="srcwave" id="srcwave"></div>
         </div>
       </section>
+
+      <div class="transport">
+        <button type="button" class="tbtn play-pause" id="play" disabled aria-label="Play / Pause" title="Play / Pause">
+          <svg class="play-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+          <svg class="pause-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5" width="3.6" height="14" rx="1"/><rect x="13.4" y="5" width="3.6" height="14" rx="1"/></svg>
+        </button>
+        <button type="button" class="tbtn stop" id="stop" disabled aria-label="Stop" title="Stop — reset to the start">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>
+        </button>
+      </div>
 
       <section class="meter" id="meter" hidden>
         <div class="meter-row">
@@ -65,9 +86,11 @@
 
     <div class="col col-right">
       <section class="controls" id="controls">
-        <div class="row">
+        <div class="row row-style">
           <span class="lbl">Style</span>
-          <input type="text" id="prompt" placeholder="e.g. lo-fi hip hop, warm Rhodes" />
+          <textarea id="prompt" rows="1" placeholder="e.g. lo-fi hip hop, warm Rhodes">A sophisticated instrumental jazz trio piece with a warm, live-in-the-room feel. The track is built upon an elegant walking upright bass line that provides both rhythmic drive and melodic counterpoint, paired with tasteful piano comping and crisp drum work featuring prominent ride cymbal patterns and subtle snare ghostflams.</textarea>
+          <button type="button" class="mode-toggle enhance-btn" id="enhance-btn"
+                  title="Expand with LM — rewrite your short style into a rich, detailed caption (5Hz LM). First use downloads ~1.2 GB.">Expand with LM</button>
           <button type="button" class="prompt-clear mode-toggle" id="prompt-clear" hidden
                   title="Clear Style" aria-label="Clear style">×</button>
         </div>
@@ -131,16 +154,13 @@
           <div style="flex:1"></div>
         </div>
 
-        <button type="button" class="gen" id="play" disabled>
-          <span class="gen-label" id="play-label">Play</span>
-        </button>
       </section>
     </div>
     </div>
 
     <footer class="footer">
       <span class="kbd-hint">
-        <kbd>Space</kbd> play/stop · type a <b>Style</b> and it restyles live in ~1 s · ride <b>Amount</b> (source → styled)
+        <kbd>Space</kbd> play / pause · type a <b>Style</b> and it restyles live in ~1 s · ride <b>Amount</b> (source → styled)
       </span>
       <button type="button" class="mode-toggle" id="reset" title="Reset Amount / Character / Mode">Reset</button>
     </footer>

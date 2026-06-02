@@ -43,8 +43,23 @@ body {
 
 /* ── Top bar ──────────────────────────────────────────────────────── */
 .top {
-  display: flex; align-items: baseline; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
   padding-bottom: 14px; border-bottom: 1px solid var(--hair);
+}
+.top-right { display: flex; align-items: center; gap: 14px; }
+/* A/B bypass pill — instant cover↔original switch. Fills with accent when you're
+   off the AI output (hearing the source), so the state is unmistakable. */
+.ab-toggle {
+  font: inherit; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); background: transparent;
+  border: 1px solid var(--hair); border-radius: 999px;
+  padding: 3px 12px; cursor: pointer; min-width: 74px;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.ab-toggle:hover:not(:disabled) { color: var(--fg); border-color: var(--fg); }
+.ab-toggle:disabled { color: var(--faint); cursor: default; opacity: 0.5; }
+.ab-toggle.ab-on {
+  color: var(--accent); border-color: var(--accent-dim); background: var(--accent-tint);
 }
 .brand { display: flex; align-items: baseline; gap: 12px; }
 .brand h1 {
@@ -141,6 +156,18 @@ body {
 .srcname b { color: var(--fg); font-weight: 500; margin-right: 8px; }
 .srcdur { color: var(--muted); }
 
+/* Detected tempo/key — editable (auto-filled from analysis, override to correct). */
+.meta-edit { display: inline-flex; align-items: baseline; gap: 5px; margin-left: 10px; color: var(--muted); }
+input.metafield {
+  width: 40px; min-width: 0; flex: none;
+  text-align: center; padding: 1px 2px;
+  font-variant-numeric: tabular-nums;
+}
+input.metafield.keyfield { width: 88px; text-align: left; }
+input.metafield:focus { border-color: var(--accent); }
+.metaunit { color: var(--muted); font-size: 10px; letter-spacing: 0.06em; }
+.metasep { color: var(--faint); }
+
 /* Playback-mode toggle (Loop ↔ One-shot) — sits next to the filename so it
    reads as a property of the source. Subtle by default; warm-taupe when
    set to one-shot. */
@@ -160,6 +187,11 @@ body {
   transition: color .15s, text-decoration-color .15s;
 }
 .mode-toggle:hover { color: var(--fg); text-decoration-color: var(--fg); }
+.enhance-btn {
+  color: var(--accent); text-decoration: none; white-space: nowrap; margin-left: 8px;
+}
+.enhance-btn:hover { color: var(--fg); }
+.enhance-btn:disabled { color: var(--faint); cursor: default; }
 .mode-toggle.one-shot {
   color: var(--accent);
   text-decoration-color: var(--accent-dim);
@@ -168,39 +200,6 @@ body {
 .srcrow {
   display: flex; align-items: center; gap: 12px; width: 100%;
 }
-.playbtn {
-  width: 22px; height: 22px; border-radius: 50%;
-  border: 1px solid var(--hair); background: transparent;
-  color: var(--fg); cursor: pointer; padding: 0;
-  display: grid; place-items: center;
-  transition: border-color .15s, color .15s;
-}
-.playbtn:hover { border-color: var(--fg); }
-.playbtn.active { border-color: var(--accent); color: var(--accent); }
-.playbtn:disabled { color: var(--faint); cursor: default; }
-.playbtn:disabled:hover { border-color: var(--hair); }
-
-/* Icon swap — driven by the `.playing` class on the button, not the SVG
-   `hidden` attribute (which is unreliable on inline <svg> across renderers).
-   The two icons live on top of each other in the same grid cell; visibility
-   is purely CSS-driven. */
-.playbtn .play-ico,
-.playbtn .pause-ico,
-.row-play .play-ico,
-.row-play .pause-ico {
-  grid-area: 1 / 1;
-  /* Inline <svg> picks up a baseline gap from the button's line-height
-     which can offset it by a sub-pixel inside the grid cell. Block-level
-     drops the baseline math entirely so place-items: center actually
-     centers the icon. */
-  display: block;
-}
-.playbtn  .pause-ico,
-.row-play .pause-ico { display: none; }
-.playbtn.playing  .play-ico,
-.row-play.playing .play-ico { display: none; }
-.playbtn.playing  .pause-ico,
-.row-play.playing .pause-ico { display: block; }
 .srctime {
   font-variant-numeric: tabular-nums; color: var(--faint);
   font-size: 10px; min-width: 32px; text-align: right;
@@ -274,7 +273,8 @@ body {
 /* BPM / Key / Prompt inputs — keep the hairline aesthetic: no surface,
    just a single underline on the baseline. */
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+textarea#prompt {
   background: transparent; border: none;
   border-bottom: 1px solid var(--hair);
   color: var(--fg); font: inherit; font-size: 12px;
@@ -282,10 +282,19 @@ input[type="number"] {
   transition: border-color .15s;
 }
 input[type="text"]:focus,
-input[type="number"]:focus { border-color: var(--fg); }
+input[type="number"]:focus,
+textarea#prompt:focus { border-color: var(--fg); }
 input[type="number"] { width: 56px; font-variant-numeric: tabular-nums; }
 input[type="text"]   { flex: 1; min-width: 100px; }
 ::placeholder { color: var(--faint); opacity: 1; }
+
+/* Style is a textarea that auto-grows (JS) to show the full caption, then scrolls. */
+textarea#prompt {
+  flex: 1; min-width: 100px;
+  resize: none; line-height: 1.4;
+  min-height: 22px; max-height: 118px; overflow-y: auto;
+}
+.row-style { align-items: flex-start; }   /* label + buttons line up with the first row of text */
 
 /* Style clear (×): a quiet hairline affordance, shown only when Style has text.
    Clearing it lifts the style-transfer floors -> morphs back toward source. */
@@ -315,37 +324,31 @@ input[type="range"]::-webkit-slider-thumb {
 /* Generate button — kept literal-cased per user feedback (design used
    uppercase, but in context it reads as shouting). Slight letter-spacing
    still gives the typographic hairline feel. */
-.gen {
-  position: relative;
-  overflow: hidden;            /* clip the progress bar to button bounds */
-  margin-top: 6px;
-  background: transparent; color: var(--fg);
-  border: 1px solid var(--fg); padding: 10px 16px;
-  font: inherit; font-size: 12px; letter-spacing: 0.04em;
-  cursor: pointer;
-  transition: background .15s, color .15s, border-color .15s;
+/* Transport: a circular Play/Pause (primary) + a separate Stop (full reset). */
+.transport { margin-top: 18px; display: flex; align-items: center; gap: 14px; }
+.tbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%; padding: 0; background: transparent; color: var(--fg);
+  cursor: pointer; transition: background .15s, color .15s, border-color .15s, transform .08s;
 }
-.gen .gen-label { position: relative; z-index: 1; }
-.gen-progress {
-  position: absolute;
-  left: 0; bottom: 0;
-  height: 2px;
-  width: 0;
-  background: var(--accent);
-  opacity: 0;
-  /* Width eases between step counts (~0.5s feels natural for ~2 s/step);
-     opacity fades in/out when busy state toggles. */
-  transition: width 0.5s ease-out, opacity 0.2s ease-out;
-  pointer-events: none;
+.tbtn svg { fill: currentColor; display: block; }
+.tbtn:active:not(:disabled) { transform: scale(0.94); }
+.tbtn:disabled { color: var(--faint); border-color: var(--hair); cursor: default; }
+
+.play-pause {
+  width: 52px; height: 52px;
+  border: 1px solid var(--accent-dim); background: var(--accent-tint); color: var(--accent);
 }
-.gen.busy .gen-progress { opacity: 0.6; }
-.gen:hover:not(:disabled) { background: var(--fg); color: var(--bg); }
-.gen:disabled {
-  color: var(--faint); border-color: var(--hair); cursor: default;
-}
-.gen.busy {
-  color: var(--accent); border-color: var(--accent-dim);
-}
+.play-pause svg { width: 22px; height: 22px; }
+.play-pause .play-ico { margin-left: 2px; }   /* optically center the triangle */
+.play-pause:hover:not(:disabled) { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.play-pause .pause-ico { display: none; }
+.play-pause.playing .play-ico { display: none; }
+.play-pause.playing .pause-ico { display: block; }
+
+.stop { width: 40px; height: 40px; border: 1px solid var(--hair); color: var(--muted); }
+.stop svg { width: 15px; height: 15px; }
+.stop:hover:not(:disabled) { color: var(--fg); border-color: var(--fg); }
 
 /* ── Results ──────────────────────────────────────────────────────── */
 .results {
@@ -628,7 +631,8 @@ input[type="range"]::-webkit-slider-thumb {
 }
 /* Roomier rows in the wider right column. */
 .col-right .row { padding: 9px 0; }
-.col-right .gen { margin-top: 14px; }
+/* Transport lives under the waveform in the left column, centered. */
+.col-left .transport { margin-top: 6px; justify-content: center; }
 
 /* ── ACE15 additions ───────────────────────────────────────────── */
 .dl { margin: 10px 0; }

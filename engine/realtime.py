@@ -16,29 +16,28 @@ from collections import deque
 import numpy as np
 
 from . import mps_compat
-from .jit import JITCover, FPS, SR, SPF, _eq
+from .jit import JITCover, FPS, SR, SPF
 
 import torch  # noqa: E402
 
 
 class RealtimeCover:
     def __init__(self, device="mps", steps=8, window_s=20.0, lookahead_s=1.0, slice_s=1.0, denoise=0.8, seed=1234,
-                 config_path="acestep-v15-turbo", xfade_s=0.12, margin_s=1.0):
+                 config_path="acestep-v15-turbo", pin_s=4.0, prime_s=2.0):
         self.jit = JITCover(device=device, steps=steps, config_path=config_path)
         self.window_s = window_s
         self.lookahead_samp = int(round(lookahead_s * SR))   # ring counts AUDIO SAMPLES
         self.SL = max(1, int(round(slice_s * FPS)))          # slice length in LATENT frames
-        # Window seams = INTERIOR overlap-add hand-off. Each window is an independent
-        # generation; its EDGES are the model's weakest region (least DiT context), so
-        # we never splice there. Instead we transition _margin_f frames BEFORE the
-        # window edge, generate the next window backed up so the playhead lands in its
-        # INTERIOR, and equal-power crossfade _xf_f frames where BOTH windows have full
-        # context (the degraded edges are discarded). Position-aligned → no timeline
-        # compression. A held tail of _xf_samp lets the next window blend into it.
-        self._xf_f = max(1, int(round(xfade_s * FPS)))       # crossfade length, latent frames
-        self._margin_f = max(self._xf_f, int(round(margin_s * FPS)))  # edge margin (>= crossfade)
-        self._xf_samp = self._xf_f * SPF                     # crossfade in samples
-        self._tail = None                                    # held-back audio [2,_xf_samp]
+        # PINNED-PREFIX ROLLING (true continuity, no seams). We keep one continuous
+        # "committed" latent and extend it in chunks: each new chunk's first _pin_f
+        # frames are PINNED (inpainting) to the committed tail, so the model denoises
+        # the new frames to CONTINUE the real past — the overlap is identical, no
+        # crossfade. window_s = the generation window; _pin_f = pinned context (fixed),
+        # _hop_f = new frames per chunk (= window − pin). Smaller window ⇒ snappier
+        # control + cheaper; larger ⇒ more new-content context per chunk.
+        self._pin_f = max(1, int(round(pin_s * FPS)))                       # pinned context frames
+        self._hop_f = max(1, int(round(window_s * FPS)) - self._pin_f)      # new frames per chunk
+        self._prime_f = max(1, int(round(prime_s * FPS)))                   # cold-prefix length for the 2-pass first chunk
         # DCW raises the output level ~1.4 dB (it slammed the limiter); make-up gain
         # to bring DCW-on output back in line with DCW-off so it stays clean.
         self._dcw_gain = 0.85
@@ -68,14 +67,16 @@ class RealtimeCover:
         self.full_T = self.jit.source.latent.tensor.shape[1]
         return self
 
-    def set_style(self, tags, denoise=None, character=None, timbre=None, send_bpm=None, send_key=None):
+    def set_style(self, tags, denoise=None, character=None, timbre=None, send_bpm=None, send_key=None,
+                  bpm=None, key=None):
         self.jit.set_style(tags, denoise=denoise if denoise is not None else self.denoise,
-                           character=character, timbre=timbre, send_bpm=send_bpm, send_key=send_key)
+                           character=character, timbre=timbre, send_bpm=send_bpm, send_key=send_key,
+                           bpm=bpm, key=key)
         return self
 
-    def set_metas(self, send_bpm=None, send_key=None):
+    def set_metas(self, send_bpm=None, send_key=None, bpm=None, key=None):
         with self._lock:
-            self._ctrl.append(("metas", (send_bpm, send_key)))
+            self._ctrl.append(("metas", (send_bpm, send_key, bpm, key)))
 
     def peaks(self):
         return self.jit.peaks
@@ -116,6 +117,7 @@ class RealtimeCover:
         self.stop()
         if window_s is not None:
             self.window_s = float(window_s)
+            self._hop_f = max(1, int(round(self.window_s * FPS)) - self._pin_f)  # new frames/chunk
         if steps is not None and int(steps) != self.jit.steps:
             self.jit.steps = int(steps)
             # rebuild the StreamPipeline handle at the new depth, reusing src+cond
@@ -141,8 +143,10 @@ class RealtimeCover:
 
     # ---- consumer (audio thread) ----
     def read(self, n):
-        """Pull n frames -> np.float32 [n,2]; zero-fill (count underrun) if short."""
-        out = np.zeros((n, 2), dtype=np.float32)
+        """Pull n frames -> np.float32 [n,4] = [coverL,coverR, origL,origR]; zero-fill
+        (count underrun) if short. The original pair is the raw source for the same
+        frames, so the client can A/B cover vs source instantly (it just picks a pair)."""
+        out = np.zeros((n, 4), dtype=np.float32)
         got = 0
         with self._lock:
             while got < n and self._ring:
@@ -166,6 +170,12 @@ class RealtimeCover:
             return self._ring_frames / SR
 
     # ---- producer thread ----
+    @property
+    def running(self):
+        """True while the producer thread is active (play OR pause — pause stops the
+        sender/consumer, NOT the producer, so playback position is kept)."""
+        return self._running
+
     def start(self):
         self._running = True
         self._thread = threading.Thread(target=self._produce, daemon=True)
@@ -177,131 +187,112 @@ class RealtimeCover:
         if self._thread:
             self._thread.join(timeout=5)
 
-    def _push(self, pcm_2xN):
-        chunk = pcm_2xN.detach().t().contiguous().numpy().astype(np.float32)  # [N,2]
+    def reset(self):
+        """Full stop: stop the producer AND reset playback to the start (clears the
+        ring, counters, and playhead origin) so the next play() begins from 0."""
+        self.stop()
+        with self._lock:
+            self._ring.clear(); self._ring_frames = 0
+            self._produced_f = 0; self._consumed_f = 0; self._real_f = 0
+            self._seek_pos_s = 0.0
+
+    def _push(self, cover_2xN, orig_2xN):
+        cov = cover_2xN.detach().t().contiguous().numpy().astype(np.float32)  # [N,2]
+        org = orig_2xN.detach().t().contiguous().numpy().astype(np.float32)   # [N,2]
+        chunk = np.concatenate([cov, org], axis=1)                           # [N,4] cover+original
         with self._lock:
             self._ring.append(chunk)
             self._ring_frames += chunk.shape[0]
             self._produced_f += chunk.shape[0]
 
-    def _emit(self, seg):
-        """Push contiguous audio, holding back the last _xf_samp samples so the next
-        window seam can crossfade into them. `seg` is torch [2,N], time-contiguous
-        with the held tail."""
-        if self._tail is not None:
-            seg = torch.cat([self._tail, seg], dim=-1)
-            self._tail = None
-        xf = self._xf_samp
-        if seg.shape[-1] > xf:
-            self._push(seg[:, :-xf])
-            self._tail = seg[:, -xf:].clone()
-        else:
-            self._tail = seg.clone()          # shorter than a crossfade; keep accumulating
-
-    def _emit_seam(self, seg):
-        """Equal-power crossfade a freshly generated window's head into the held tail
-        (the previous window's last _xf_samp samples), then emit the remainder. The
-        producer backs the new window up by _xf_f frames so seg[:xf] covers the SAME
-        timeline as the tail (no compression); at the loop point it blends track-end
-        into track-start."""
-        if self._tail is None:
-            self._emit(seg); return
-        ov = min(self._xf_samp, self._tail.shape[-1], seg.shape[-1])
-        if ov <= 0:
-            self._emit(seg); return
-        fin, fout = _eq(ov, seg.device, seg.dtype)
-        head = self._tail[:, :-ov] if self._tail.shape[-1] > ov else None
-        blend = self._tail[:, -ov:] * fout + seg[:, :ov] * fin
-        self._tail = None
-        parts = ([head] if head is not None else []) + [blend, seg[:, ov:]]
-        self._emit(torch.cat(parts, dim=-1))
-
     def _produce(self):
+        """Pinned-prefix ROLLING producer. Maintain one continuous `committed` latent;
+        extend it in chunks where each chunk's first _pin_f frames are pinned to the
+        committed tail (jit._gen(pin=...)) so the new frames continue the real past —
+        seamless. Decode the committed latent with the existing overlap-discard tiler
+        (lazily, trailing the frontier by the VAE margin so every decoded tile has full
+        context) and push. No crossfade — continuity is by construction."""
         torch.set_grad_enabled(False)   # grad flag is THREAD-LOCAL; disable in this worker
-        self._tail = None               # fresh stream: no carry-over crossfade tail
+        from acestep.nodes.types import Latent
         jit = self.jit
-        W = int(round(self.window_s * FPS))
-        W = min(W, self.full_T)
-        committed_f = 0
-        win_start = -10 ** 9
-        win_lat = None
-        win_tiles: dict = {}
-        win_nf = 0
-        force = False
+        C = max(1, min(self._pin_f, self.full_T // 2))   # pinned context frames
+        H = max(1, self._hop_f)                           # new frames per chunk
+        headroom = jit._TILE + jit._TOV                   # extra committed needed for full-context decode tiles
+        committed = None                                  # [1,n,D] continuous clean latent (model dtype)
+        base_f = 0                                        # source frame of committed[0]
+        gen_f = 0; dec_f = 0                              # source frames: generated-to / decoded-pushed-to
+        tiles: dict = {}                                  # decode cache (tile idx local to base_f -> audio)
         while self._running:
-            if committed_f >= self.full_T:     # loop the track for continuous live play
-                committed_f = 0; win_lat = None
-            # drain control queue
+            if dec_f >= self.full_T:                      # loop the track (hard restart at the loop point)
+                committed = None; base_f = gen_f = dec_f = 0; tiles = {}
             with self._lock:
                 ctrls = list(self._ctrl); self._ctrl.clear()
                 ahead = self._produced_f - self._consumed_f
+            restyled = False
             for kind, val in ctrls:
-                if kind == "prompt":
-                    jit._set_prompt(val)
-                elif kind == "denoise":
-                    jit.denoise = val
-                elif kind == "character":
-                    jit.set_character(val)
-                elif kind == "metas":
-                    jit.set_metas(send_bpm=val[0], send_key=val[1])
-                elif kind == "dcw":
-                    jit.set_dcw(enabled=val)
+                if kind == "prompt":      jit._set_prompt(val); restyled = True
+                elif kind == "denoise":   jit.denoise = val; restyled = True
+                elif kind == "character": jit.set_character(val); restyled = True
+                elif kind == "metas":     jit.set_metas(send_bpm=val[0], send_key=val[1], bpm=val[2], key=val[3]); restyled = True
+                elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
                 elif kind == "seek":
-                    committed_f = val          # jump the playback cursor
-                    win_lat = None             # force a regen at the new position
-                    self._tail = None          # clean cut at the seek point (no crossfade)
-                    with self._lock:           # flush the now-stale buffered audio
+                    committed = None; base_f = gen_f = dec_f = int(val); tiles = {}
+                    with self._lock:      # flush stale buffered audio; re-prime from the seek point
                         self._ring.clear(); self._ring_frames = 0
                         self._produced_f = 0; self._consumed_f = 0; self._real_f = 0
-                        self._seek_pos_s = val / FPS   # playhead origin = seek point
-                force = True
-            # Keep the ring ahead by at least one worst-case regen. A regen blocks
-            # production for ~max_step_ms; if the buffer is smaller than that, the
-            # consumer underruns mid-regen -> glitchy/"metallic" gaps. So the target
-            # auto-grows to cover the MEASURED worst regen (+0.4s margin), which is
-            # what makes a big window / slow model / DCW safe. Costs control latency
-            # (= buffer depth); capped so a one-off stall can't balloon it.
+                        self._seek_pos_s = val / FPS
+            # A re-style change only affects FUTURE chunks; the latent already generated
+            # ahead (up to one hop, old settings) would otherwise play out first -> the
+            # change "takes a long time", variably (depends where in the gen cycle it lands).
+            # Discard that un-decoded ahead and regenerate from the decode point with the new
+            # settings, PINNED to the decoded past (smooth morph). Latency then = the decoded
+            # ring depth (~buffer), not a hop; no gap (the ring covers the regen).
+            if restyled and committed is not None and gen_f > dec_f and (dec_f - base_f) >= C:
+                committed = committed[:, :dec_f - base_f, :].contiguous()
+                gen_f = dec_f
+                tcut = (dec_f - base_f) // jit._TILE          # drop decoded-ahead tiles at/after dec_f
+                tiles = {t: v for t, v in tiles.items() if t < tcut}
+            # adaptive buffer: keep the ring ahead by >= one worst-case chunk (auto-grows
+            # to the measured worst step). committed is None right after seek/start/loop
+            # -> never wait, produce immediately.
             target = max(self.lookahead_samp, int(min(8.0, self.max_step_ms / 1000 + 0.4) * SR))
-            if ahead >= target + self.SL * SPF and not force:
+            if committed is not None and ahead >= target + self.SL * SPF:
                 time.sleep(0.003)
                 continue
-            # Hand off to the next window a margin BEFORE the current one's edge (the
-            # last window plays fully to the track end). usable_end = where this window
-            # stops being trusted; the [usable_end, win_end] tail is the discarded edge.
-            win_end = win_start + win_nf
-            last_win = win_end >= self.full_T
-            usable_end = win_end if last_win else win_end - self._margin_f
-            if win_lat is None or committed_f >= usable_end or force:
-                # Seam: back the new window up by _margin_f so the playhead lands in its
-                # INTERIOR; decode only from _xf_f before the playhead (the crossfade
-                # region, aligned with the held tail). back=0 at stream start / loop.
-                seam = self._tail is not None and committed_f >= self._margin_f
-                back = self._margin_f if seam else 0
-                win_start = max(0, min(committed_f - back, self.full_T - W))
-                from_f = max(win_start, committed_f - self._xf_f) if seam else committed_f
-                t0 = time.perf_counter()
-                win_lat = jit._gen(win_start, min(win_start + W, self.full_T), self.seed)
-                win_nf = win_lat.tensor.shape[1]
-                win_tiles = {}
-                f1 = min(committed_f + self.SL, win_start + win_nf, self.full_T)
-                seg = jit._ensure_tiles(win_lat, win_tiles, from_f - win_start, f1 - win_start)
-                mps_compat.mps_sync()
-                if jit.dcw_enabled: seg = seg * self._dcw_gain   # make-up for DCW's level boost
-                self.max_step_ms = max(self.max_step_ms, (time.perf_counter() - t0) * 1000)
+            t_iter = time.perf_counter()
+            dec_target = min(dec_f + self.SL, self.full_T)
+            # 1) extend the committed latent (pinned roll) until we can decode the slice
+            #    with full VAE context (or we hit the track end).
+            while committed is None or (gen_f < dec_target + headroom and gen_f < self.full_T):
+                if committed is None:
+                    # First chunk (also after seek/loop) has no styled predecessor, so a
+                    # cold cover leans weakly on the source ("style hasn't taken hold yet").
+                    # 2-pass fix: a quick cold pass yields a short prefix to PIN, then we
+                    # regenerate in continuation mode so the body gets the same style boost
+                    # every rolling chunk gets. Only the first ~prime_s stays cold.
+                    w1 = min(base_f + C + H, self.full_T)
+                    cold = jit._gen(base_f, min(base_f + self._prime_f + C, w1), self.seed).tensor
+                    cp = min(self._prime_f, cold.shape[1] - 1)
+                    committed = jit._gen(base_f, w1, self.seed, pin=cold[:, :cp, :]).tensor
+                    gen_f = base_f + committed.shape[1]
+                else:
+                    pin = committed[:, -C:, :]
+                    new = jit._gen(gen_f - C, min(gen_f + H, self.full_T), self.seed, pin=pin).tensor[:, C:, :]
+                    committed = torch.cat([committed, new], dim=1)
+                    gen_f += new.shape[1]
                 self.regens += 1
-                force = False
-                # Crossfade whenever a tail exists (interior seam, or loop end→start);
-                # plain emit only at the very first window / after a seek (tail cleared).
-                self._emit_seam(seg) if self._tail is not None else self._emit(seg)
-                committed_f = from_f + seg.shape[-1] // SPF
-                mps_compat.reclaim()
-                continue
-            f1 = min(committed_f + self.SL, usable_end, self.full_T)
-            seg = jit._ensure_tiles(win_lat, win_tiles, committed_f - win_start, f1 - win_start)
+            # 2) decode + push the next slice from the continuous committed latent
+            seg = jit._ensure_tiles(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
             mps_compat.mps_sync()
             if jit.dcw_enabled: seg = seg * self._dcw_gain   # make-up for DCW's level boost
-            self._emit(seg)
-            committed_f = f1
+            orig = jit.source_slice(dec_f, seg.shape[-1])    # raw source, same frames -> instant A/B
+            self._push(seg, orig)
+            dec_f = dec_target
+            self.max_step_ms = max(self.max_step_ms, (time.perf_counter() - t_iter) * 1000)
+            keep = (dec_f - base_f) // jit._TILE - 1          # prune decoded tiles behind the playhead
+            for t in [t for t in tiles if t < keep]:
+                del tiles[t]
+            mps_compat.reclaim()
         self._done = True
 
     @property

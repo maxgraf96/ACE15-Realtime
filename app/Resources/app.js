@@ -17,6 +17,7 @@ function nf(name) {
 const uploadAudio = nf("uploadAudio");
 const setStyleFn  = nf("setStyle");
 const setPrompt   = nf("setPrompt");
+const enhanceFn   = nf("enhance");
 const setDenoise  = nf("setDenoise");
 const setChar     = nf("setCharacter");
 const setEvolve   = nf("setEvolve");
@@ -26,7 +27,9 @@ const reconfigure = nf("reconfigure");
 const setModel    = nf("setModel");
 const setMetas    = nf("setMetas");
 const play        = nf("play");
+const pauseFn     = nf("pause");
 const stop        = nf("stop");
+const setBypassFn = nf("setBypass");
 const openFile    = nf("openFile");
 
 // ── DOM ──────────────────────────────────────────────────────────────
@@ -34,24 +37,38 @@ const $ = (id) => document.getElementById(id);
 const statusEl = $("status"), statusText = $("status-text");
 const sourceEl = $("source"), sourceEmpty = $("source-empty"), sourceLoaded = $("source-loaded");
 const sourceLoading = $("source-loading"), loadName = $("loadname-text"), loadStage = $("loadstage-text");
-const srcName = $("srcname-text"), srcDur = $("srcdur-text"), bpmkey = $("bpmkey"), srcWave = $("srcwave");
+const srcName = $("srcname-text"), srcDur = $("srcdur-text"), srcWave = $("srcwave");
+const metaEdit = $("meta-edit"), bpmField = $("bpm-field"), keyField = $("key-field");
 const meterEl = $("meter"), mBuf = $("m-buf"), mRegens = $("m-regens"), mLat = $("m-lat");
-const promptEl = $("prompt"), promptClear = $("prompt-clear");
+const promptEl = $("prompt"), promptClear = $("prompt-clear"), enhanceBtn = $("enhance-btn");
 const denoiseEl = $("denoise"), denoiseVal = $("denoise-value");
 const charEl = $("character"), charVal = $("character-value");
 const stepsEl = $("steps"), stepsVal = $("steps-value");
 const windowEl = $("window"), evolveEl = $("evolve-toggle");
-const playBtn = $("play"), playLabel = $("play-label");
+const playBtn = $("play"), stopBtn = $("stop"), abEl = $("ab-toggle");
 const dl = $("dl"), dlFill = $("dl-fill");
 const errBanner = $("error-banner"), errText = $("error-text"), errDismiss = $("error-dismiss");
 const filePicker = $("file-picker");
 
-let loaded = false, styled = false, playing = false, evolve = false;
+let loaded = false, styled = false, evolve = false;
+let playState = "stopped";   // "stopped" | "playing" | "paused"
+const started = () => playState !== "stopped";   // producer running (play OR pause) -> use live setters
 let playheadEl = null;
 let trackDur = 0;   // seconds, for the m:ss position readout
 
 function setStatus(t, cls) { statusText.textContent = t; statusEl.className = "status" + (cls ? " " + cls : ""); }
-function refresh() { playBtn.disabled = !(loaded && styled); }
+function refresh() {
+  const ready = loaded && styled;
+  playBtn.disabled = !ready;
+  stopBtn.disabled = !ready || playState === "stopped";
+  abEl.disabled = !ready;
+}
+function setTransport(state) {   // drive the transport buttons + status
+  playState = state;
+  playBtn.classList.toggle("playing", state === "playing");
+  if (state === "stopped") { if (playheadEl) playheadEl.style.left = "0%"; showPos(0); }
+  refresh();
+}
 function fmtTime(s) { s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
 function showPos(frac) { if (trackDur) srcDur.textContent = fmtTime(frac * trackDur) + " / " + fmtTime(trackDur); }
 
@@ -139,27 +156,41 @@ document.addEventListener("drop", (e) => {
 // Live edits use the QUEUED setters (applied in the engine's producer thread).
 // setStyle re-encodes directly, so only call it when NOT playing.
 function applyStyle() { setStyleFn(promptEl.value, parseFloat(denoiseEl.value), parseFloat(charEl.value)); }
+function autogrow() { promptEl.style.height = "auto"; promptEl.style.height = Math.min(promptEl.scrollHeight, 118) + "px"; }
 
 let promptTimer = null;
 promptEl.addEventListener("input", () => {
-  promptClear.hidden = !promptEl.value;
+  promptClear.hidden = !promptEl.value; autogrow();
   clearTimeout(promptTimer);
   promptTimer = setTimeout(() => {
     if (!styled) { applyStyle(); return; }
-    if (playing) setPrompt(promptEl.value); else applyStyle();
+    if (started()) setPrompt(promptEl.value); else applyStyle();
   }, 450);
 });
-promptClear.addEventListener("click", () => { promptEl.value = ""; promptClear.hidden = true; if (playing) setPrompt(""); else applyStyle(); });
+promptClear.addEventListener("click", () => { promptEl.value = ""; promptClear.hidden = true; autogrow(); if (started()) setPrompt(""); else applyStyle(); });
+promptClear.hidden = !promptEl.value; autogrow();   // reflect the default prompt
+
+// ✨ Enhance: send the short style to the 5Hz LM; it replies with a rich caption
+// (engineEvent "enhanced"). Works with no track loaded. First use downloads the LM.
+let enhancing = false;
+enhanceBtn.addEventListener("click", () => {
+  const v = promptEl.value.trim();
+  if (!v || enhancing) return;
+  enhancing = true; enhanceBtn.disabled = true; enhanceBtn.textContent = "Expanding…";
+  setStatus("expanding prompt…", "accent");
+  enhanceFn(v);
+});
+function endEnhance() { enhancing = false; enhanceBtn.disabled = false; enhanceBtn.textContent = "Expand with LM"; }
 
 denoiseEl.addEventListener("input", () => denoiseVal.textContent = parseFloat(denoiseEl.value).toFixed(2));
-denoiseEl.addEventListener("change", () => { if (playing) setDenoise(parseFloat(denoiseEl.value)); else if (styled) applyStyle(); });
+denoiseEl.addEventListener("change", () => { if (started()) setDenoise(parseFloat(denoiseEl.value)); else if (styled) applyStyle(); });
 
 charEl.addEventListener("input", () => charVal.textContent = parseFloat(charEl.value).toFixed(2));
-charEl.addEventListener("change", () => { if (playing) setChar(parseFloat(charEl.value)); else if (styled) applyStyle(); });
+charEl.addEventListener("change", () => { if (started()) setChar(parseFloat(charEl.value)); else if (styled) applyStyle(); });
 
 stepsEl.addEventListener("input", () => stepsVal.textContent = stepsEl.value);
-stepsEl.addEventListener("change", () => { if (playing) reconfigure(parseInt(stepsEl.value), parseFloat(windowEl.value)); });
-windowEl.addEventListener("change", () => { if (playing) reconfigure(parseInt(stepsEl.value), parseFloat(windowEl.value)); });
+stepsEl.addEventListener("change", () => { if (started()) reconfigure(parseInt(stepsEl.value), parseFloat(windowEl.value)); });
+windowEl.addEventListener("change", () => { if (started()) reconfigure(parseInt(stepsEl.value), parseFloat(windowEl.value)); });
 
 evolveEl.addEventListener("click", () => {
   evolve = !evolve; evolveEl.textContent = evolve ? "Evolve" : "Coherent";
@@ -173,19 +204,23 @@ const dcwEl = $("dcw-toggle");
 dcwEl.addEventListener("click", () => {
   dcw = !dcw; dcwEl.textContent = dcw ? "DCW On" : "DCW Off";
   dcwEl.classList.toggle("one-shot", dcw);
-  setDcw(dcw);                            // updates native state (+ live regen if playing)
-  if (!playing && styled) applyStyle();  // not playing: rebuild the handle in the new DCW state
+  setDcw(dcw);                              // updates native state (+ live regen if running)
+  if (!started() && styled) applyStyle();  // not running: rebuild the handle in the new DCW state
 });
 
-// Match tempo/key toggles (inject detected bpm/key into the prompt Metas)
+// Match tempo/key toggles (inject the bpm/key from the editable fields into the
+// prompt Metas) + the editable BPM/Key fields themselves (auto-filled from
+// analysis on "styled"; edits correct a wrong detection).
 let sendBpm = true, sendKey = true;
 const bpmToggle = $("bpm-toggle"), keyToggle = $("key-toggle");
 function pushMetas() {
-  setMetas(sendBpm, sendKey);            // syncs native state + live re-encode if playing
-  if (!playing && styled) applyStyle();  // not playing: re-encode now with the new flags
+  setMetas(sendBpm, sendKey, bpmField.value.trim(), keyField.value.trim());  // flags + (edited) values
+  if (!started() && styled) applyStyle();  // not running: re-encode now with the new state
 }
 bpmToggle.addEventListener("click", () => { sendBpm = !sendBpm; bpmToggle.classList.toggle("one-shot", sendBpm); pushMetas(); });
 keyToggle.addEventListener("click", () => { sendKey = !sendKey; keyToggle.classList.toggle("one-shot", sendKey); pushMetas(); });
+bpmField.addEventListener("change", pushMetas);
+keyField.addEventListener("change", pushMetas);
 
 let model = "quality";   // default = XL (best sound)
 const modelEl = $("model-toggle");
@@ -199,15 +234,32 @@ modelEl.addEventListener("click", () => {
   setModel(model);   // C++ reloads the current track on the new model (downloads XL on first use)
 });
 
+// Play/Pause: toggle between play (start/resume) and pause (keep position).
+// Pause leaves the producer running, so resuming is instant.
 playBtn.addEventListener("click", () => {
-  if (!playing) { play(); playing = true; playLabel.textContent = "Stop"; playBtn.classList.add("playing"); setStatus("playing", "accent"); }
-  else { stop(); playing = false; playLabel.textContent = "Play"; playBtn.classList.remove("playing"); setStatus("stopped"); }
+  if (playState === "playing") { pauseFn(); setTransport("paused"); setStatus("paused"); }
+  else { play(); setTransport("playing"); setStatus("playing", "accent"); }
+});
+// Stop: full stop — the engine resets to the start.
+stopBtn.addEventListener("click", () => {
+  if (playState === "stopped") return;
+  stop(); setTransport("stopped"); setStatus("ready — press Play");
+});
+// A/B bypass: hear the original source vs the cover. Instant — the engine streams
+// both (frame-aligned), so this only flips which pair C++ outputs (no regen).
+let bypass = false;
+abEl.addEventListener("click", () => {
+  bypass = !bypass;
+  abEl.textContent = bypass ? "Original" : "Cover";
+  abEl.classList.toggle("ab-on", bypass);
+  abEl.title = `A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: ${bypass ? "Original" : "Cover"}.`;
+  setBypassFn(bypass);
 });
 $("reset").addEventListener("click", () => {
   denoiseEl.value = 0.7; denoiseVal.textContent = "0.70";
   charEl.value = 0; charVal.textContent = "0.00";
   if (evolve) evolveEl.click();
-  if (playing) { setDenoise(0.7); setChar(0); } else if (styled) applyStyle();
+  if (started()) { setDenoise(0.7); setChar(0); } else if (styled) applyStyle();
 });
 document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && document.activeElement !== promptEl && document.activeElement !== windowEl) {
@@ -223,6 +275,16 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       if (ev.stage === "model") setStage("loading model…");
       else if (ev.stage === "analyze") setStage("analyzing track…");
       break;
+    case "enhancing":
+      setStatus("expanding prompt…", "accent");   // (first run also loads the LM)
+      break;
+    case "enhanced":
+      endEnhance();
+      promptEl.value = ev.caption || promptEl.value;
+      promptClear.hidden = !promptEl.value; autogrow();
+      if (started()) setPrompt(promptEl.value); else if (styled) applyStyle();   // use it now
+      setStatus("prompt expanded", "accent");
+      break;
     case "loaded":
       loaded = true;
       sourceEl.classList.remove("empty");
@@ -233,15 +295,18 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       applyStyle();                       // create the handle -> "styled"
       break;
     case "styled":
-      styled = true; bpmkey.textContent = `${ev.bpm} BPM · ${ev.key}`;
-      if (!sourceLoading.hidden) {         // first styled after a (re)load -> reveal the ready track
+      styled = true;
+      if (!sourceLoading.hidden) {         // first styled after a (re)load -> reveal + auto-fill detection
+        bpmField.value = ev.bpm; keyField.value = ev.key;   // editable; override corrects a wrong detection
+        metaEdit.hidden = false;
         hideLoading(); sourceEmpty.hidden = true; sourceLoaded.hidden = false; meterEl.hidden = false;
       }
-      refresh();
-      if (playing) play();   // resume after a model/track reload (new engine starts stopped)
-      setStatus(playing ? "playing" : "ready — press Play");
+      if (playState === "playing") { play(); setTransport("playing"); setStatus("playing", "accent"); }   // resume after a (re)load (new engine starts stopped)
+      else { setTransport("stopped"); setStatus("ready — press Play"); }
       break;
     case "playing": setStatus("playing", "accent"); break;
+    case "paused":  setStatus("paused"); break;
+    case "stopped": setStatus("ready — press Play"); break;
     case "stats":
       mBuf.textContent = (ev.buffered_s ?? 0).toFixed(1) + "s";
       mRegens.textContent = ev.regens ?? "–";
@@ -259,6 +324,7 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       break;
     case "error":
       errText.textContent = ev.msg || "error"; errBanner.hidden = false; setStatus("error", "error");
+      endEnhance();                                   // re-enable Enhance if it failed
       hideLoading();                                  // don't strand the user on the spinner
       if (!loaded) { sourceEmpty.hidden = false; sourceEl.classList.add("empty"); }
       break;

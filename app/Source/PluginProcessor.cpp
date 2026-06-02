@@ -158,16 +158,21 @@ void ACE15Processor::setStyle(const juce::String& tags, double denoise, double c
     m.getDynamicObject()->setProperty("character", character);
     m.getDynamicObject()->setProperty("send_bpm", sendBpm);
     m.getDynamicObject()->setProperty("send_key", sendKey);
+    if (metaBpm.isNotEmpty()) m.getDynamicObject()->setProperty("bpm", metaBpm);   // edited tempo (else engine uses detected)
+    if (metaKey.isNotEmpty()) m.getDynamicObject()->setProperty("key", metaKey);   // edited key
     m.getDynamicObject()->setProperty("dcw", dcwEnabled);   // start the handle in the right DCW state
     ipc.sendControl(m);
 }
 
-void ACE15Processor::setMetas(bool bpmOn, bool keyOn)
+void ACE15Processor::setMetas(bool bpmOn, bool keyOn, const juce::String& bpm, const juce::String& key)
 {
     sendBpm = bpmOn; sendKey = keyOn;
+    metaBpm = bpm.trim(); metaKey = key.trim();   // remembered so a re-style (style frame) keeps them
     auto m = makeMsg("metas");
     m.getDynamicObject()->setProperty("send_bpm", bpmOn);
     m.getDynamicObject()->setProperty("send_key", keyOn);
+    if (metaBpm.isNotEmpty()) m.getDynamicObject()->setProperty("bpm", metaBpm);
+    if (metaKey.isNotEmpty()) m.getDynamicObject()->setProperty("key", metaKey);
     ipc.sendControl(m);
 }
 
@@ -176,6 +181,13 @@ void ACE15Processor::setPrompt(const juce::String& tags)
     auto m = makeMsg("prompt");
     m.getDynamicObject()->setProperty("tags", tags);
     ipc.sendControl(m);
+}
+
+void ACE15Processor::enhance(const juce::String& tags)
+{
+    auto m = makeMsg("enhance");
+    m.getDynamicObject()->setProperty("tags", tags);
+    ipc.sendControl(m);   // sidecar replies with an "enhanced" event (the rewritten caption)
 }
 
 void ACE15Processor::setDenoise(double v)
@@ -222,8 +234,13 @@ void ACE15Processor::reconfigure(int steps, double window)
     ipc.sendControl(m);
 }
 
-void ACE15Processor::play() { ipc.sendControl(makeMsg("play")); playing = true; }
-void ACE15Processor::stop() { ipc.sendControl(makeMsg("stop")); playing = false; }
+void ACE15Processor::play()  { ipc.sendControl(makeMsg("play"));  playing = true;  }   // play / resume
+void ACE15Processor::pause() { ipc.sendControl(makeMsg("pause")); playing = false; }   // keep position
+void ACE15Processor::stop()  { ipc.sendControl(makeMsg("stop"));  playing = false; }   // full stop, reset to 0
+
+// A/B: purely local — the engine already streams both cover and original, so this
+// just flips which pair the audio callback outputs. No control frame, no latency.
+void ACE15Processor::setBypass(bool on) { ipc.setBypass(on); }
 
 juce::AudioProcessorEditor* ACE15Processor::createEditor() { return new ACE15Editor(*this); }
 

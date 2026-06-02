@@ -2,7 +2,7 @@
 
 IpcClient::IpcClient()
 {
-    ring.setSize(2, kRingFrames);
+    ring.setSize(kStreamChannels, kRingFrames);
     ring.clear();
 }
 
@@ -63,10 +63,10 @@ void IpcClient::netLoop()
         if (len > 0 && ! recvExact(payload.get(), (int) len))
             break;
 
-        if (type == 0x02) // AUDIO: float32 interleaved stereo
+        if (type == 0x02) // AUDIO: float32 interleaved 4ch (cover pair + original pair)
         {
-            const int frames = (int) (len / (sizeof(float) * 2));
-            pushAudioInterleaved(reinterpret_cast<const float*>(payload.get()), frames, 2);
+            const int frames = (int) (len / (sizeof(float) * kStreamChannels));
+            pushAudioInterleaved(reinterpret_cast<const float*>(payload.get()), frames, kStreamChannels);
         }
         else if (type == 0x03) // EVENT: JSON
         {
@@ -87,7 +87,7 @@ void IpcClient::pushAudioInterleaved(const float* inter, int frames, int channel
     fifo.prepareToWrite(frames, start1, size1, start2, size2);
     auto deinterleave = [&](int dstStart, int n, int srcOffset)
     {
-        for (int ch = 0; ch < 2; ++ch)
+        for (int ch = 0; ch < channels; ++ch)
         {
             float* dst = ring.getWritePointer(ch) + dstStart;
             for (int i = 0; i < n; ++i)
@@ -104,9 +104,10 @@ int IpcClient::popAudio(float* const* out, int numCh, int n)
     int start1, size1, start2, size2;
     fifo.prepareToRead(n, start1, size1, start2, size2);
     const int got = size1 + size2;
+    const int pair = bypass.load() ? 2 : 0;   // ring ch 0/1 = cover, 2/3 = original source
     for (int ch = 0; ch < numCh; ++ch)
     {
-        const int src = juce::jmin(ch, 1); // mono-out fallback uses ch0
+        const int src = pair + juce::jmin(ch, 1); // mono-out fallback uses the pair's left
         float* d = out[ch];
         if (size1 > 0) juce::FloatVectorOperations::copy(d, ring.getReadPointer(src) + start1, size1);
         if (size2 > 0) juce::FloatVectorOperations::copy(d + size1, ring.getReadPointer(src) + start2, size2);

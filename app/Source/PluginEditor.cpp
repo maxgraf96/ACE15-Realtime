@@ -41,6 +41,10 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
               processor.setStyle(args[0].toString(), (double) args[1], args.size() > 2 ? (double) args[2] : 0.0);
               completion({});
           })
+          .withNativeFunction("enhance", [this](auto args, auto completion)
+          {
+              processor.enhance(args[0].toString()); completion({});
+          })
           .withNativeFunction("setPrompt", [this](auto args, auto completion)
           {
               processor.setPrompt(args[0].toString()); completion({});
@@ -75,16 +79,21 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           })
           .withNativeFunction("setMetas", [this](auto args, auto completion)
           {
-              processor.setMetas((bool) args[0], (bool) args[1]); completion({});
+              processor.setMetas((bool) args[0], (bool) args[1],
+                                 args.size() > 2 ? args[2].toString() : juce::String(),
+                                 args.size() > 3 ? args[3].toString() : juce::String());
+              completion({});
           })
           .withNativeFunction("play", [this](auto, auto completion) { processor.play(); completion({}); })
-          .withNativeFunction("stop", [this](auto, auto completion) { processor.stop(); completion({}); }))
+          .withNativeFunction("pause", [this](auto, auto completion) { processor.pause(); completion({}); })
+          .withNativeFunction("stop", [this](auto, auto completion) { processor.stop(); completion({}); })
+          .withNativeFunction("setBypass", [this](auto args, auto completion) { processor.setBypass((bool) args[0]); completion({}); }))
 {
     processor.onEngineEvent = [this](juce::var v) { emitToJs(v); };
     addAndMakeVisible(webView);
     webView.goToURL(juce::String(kOrigin) + "/index.html");
     setResizable(true, true);
-    setSize(760, 520);
+    setSize(960, 600);
 }
 
 ACE15Editor::~ACE15Editor() { processor.onEngineEvent = nullptr; }

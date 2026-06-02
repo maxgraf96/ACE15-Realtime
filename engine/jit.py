@@ -92,6 +92,7 @@ class JITCover:
         # (funk CLAP 0.22 vs 0.14) — the source structure already implies instrumental.
         self.lyrics = ""
         self.peaks: list = []
+        self.source_wav = None                 # [C, samples] @ SR — kept for the instant A/B bypass
         self.bpm = 120; self.key = "C major"   # auto-detected in load_track
 
     def load_track(self, path, seconds=None, detect=True):
@@ -122,7 +123,26 @@ class JITCover:
         ctx = self.session.extract_hints(lat)
         self.source = PreparedSource(latent=lat, context_latent=ctx)
         self.peaks = self._compute_peaks(a.waveform, 220)
+        self.source_wav = a.waveform.detach().float().cpu()   # raw source @ SR, for instant A/B
         return self
+
+    def source_slice(self, f0, n_samples):
+        """Original source audio for the slice starting at latent frame f0, exactly
+        n_samples long (zero-padded past the end), as stereo [2, n_samples]. Frame f
+        maps to samples [f*SPF:(f+1)*SPF], so this is sample-aligned with the decoded
+        cover for the same frames -> the client can A/B cover vs source with no drift."""
+        if self.source_wav is None:
+            return torch.zeros(2, n_samples)
+        w = self.source_wav
+        if w.shape[0] == 1:
+            w = w.expand(2, -1)
+        elif w.shape[0] > 2:
+            w = w[:2]
+        s0 = f0 * SPF
+        seg = w[:, s0:s0 + n_samples]
+        if seg.shape[-1] < n_samples:
+            seg = torch.cat([seg, torch.zeros(2, n_samples - seg.shape[-1], dtype=seg.dtype)], dim=-1)
+        return seg
 
     @staticmethod
     def _compute_peaks(wav, n):
@@ -187,9 +207,20 @@ class JITCover:
         if self.handle is not None:
             self.handle.conditioning = self.cond
 
-    def set_metas(self, send_bpm=None, send_key=None):
+    def _set_bpm_key(self, bpm=None, key=None):
+        """Override the auto-detected tempo/key from user input (best-effort parse).
+        Empty/garbage is ignored so a stray keystroke can't blank the conditioning."""
+        if bpm is not None:
+            try: self.bpm = int(float(str(bpm).strip()))
+            except (ValueError, TypeError): pass
+        if key is not None:
+            k = str(key).strip()
+            if k: self.key = k
+
+    def set_metas(self, send_bpm=None, send_key=None, bpm=None, key=None):
         if send_bpm is not None: self.send_bpm = bool(send_bpm)
         if send_key is not None: self.send_key = bool(send_key)
+        self._set_bpm_key(bpm, key)
         self._encode()
 
     def set_style(self, tags, denoise=0.8, character=None, bpm=None, key=None, timbre=None,
@@ -200,8 +231,7 @@ class JITCover:
             self.character = float(character)
         elif timbre is not None:                          # back-compat: "source"/"none"
             self.character = 1.0 if timbre == "source" else 0.0
-        if bpm is not None: self.bpm = bpm
-        if key is not None: self.key = key
+        self._set_bpm_key(bpm, key)
         if send_bpm is not None: self.send_bpm = bool(send_bpm)
         if send_key is not None: self.send_key = bool(send_key)
         self._encode()
@@ -242,13 +272,24 @@ class JITCover:
         self.character = float(c)
         self._encode()
 
-    def _gen(self, w0, w1, seed):
+    def _gen(self, w0, w1, seed, pin=None):
+        """Generate the cover latent for source[w0:w1]. If `pin` ([1,C,D] clean
+        latent) is given, the window's first C frames are PINNED to it via an
+        inpainting mask (mask=0 preserve, mask=1 generate): the new frames are
+        denoised to CONTINUE that fixed past -> seamless rolling (no per-window seam)."""
         from acestep.nodes.types import Latent
         from acestep.engine.session import PreparedSource
         src = self.source.latent.tensor[:, w0:w1, :]
         ctx = self.source.context_latent.tensor[:, w0:w1, :]
         self.handle.context_latent = Latent(tensor=ctx)
-        self.handle.source = PreparedSource(latent=Latent(tensor=src), context_latent=Latent(tensor=ctx))
+        src_lat = Latent(tensor=src)
+        if pin is not None:
+            from acestep.engine.masking import LatentNoiseMask
+            C = pin.shape[1]
+            orig = src.clone(); orig[:, :C, :] = pin.to(src.dtype)
+            m = torch.ones(1, src.shape[1], 1, device=src.device, dtype=src.dtype); m[:, :C, :] = 0.0
+            src_lat.mask = LatentNoiseMask(mask=m, original_latents=orig)
+        self.handle.source = PreparedSource(latent=src_lat, context_latent=Latent(tensor=ctx))
         eff_seed = seed + (self._regen if self.evolve else 0)   # Evolve: browse new variations
         self._regen += 1
         lat = self.handle.tick(drain=True, denoise=self.denoise, seed=eff_seed)

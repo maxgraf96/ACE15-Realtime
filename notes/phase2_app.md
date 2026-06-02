@@ -180,6 +180,81 @@ it "properly like DEMON" (rolling buffer), no hacks.
   soft-clip limiter (it ran hot — see the DCW-default-OFF note). `_dcw_gain` in the
   producer, applied to each emitted slice.
 
+## Pinned-prefix ROLLING engine — the real continuity fix (replaces windowed crossfade)
+
+User confirmed the windowed crossfade still had audible seams near song segments
+(verse→drop). Replaced the windowed producer with a **continuous rolling latent**
+(time-axis inpainting) — the proper DEMON-style rolling buffer.
+
+- **Mechanism:** keep ONE continuous `committed` latent; extend it in chunks where
+  each chunk's first `_pin_f` frames are PINNED (inpainting `LatentNoiseMask`,
+  mask=0 preserve / mask=1 generate) to the committed tail. The model denoises the
+  new frames to CONTINUE the fixed past → the overlap is identical, **no crossfade,
+  no seam by construction**. `jit._gen(..., pin=clean_tail)` builds the mask;
+  `RealtimeCover._produce` rolls + decodes the committed latent with the existing
+  overlap-discard tiler (lazy, trailing the frontier by `_TILE+_TOV` so every
+  decoded tile has full VAE context). window_s = generation window; pin = 4s fixed
+  context; hop = window − pin = new frames/chunk.
+- **Probe first** (`bench/rolling_probe.py`): pin honored exactly (err 0.0000),
+  continuity at pin→new = 0.87× a typical frame step (no jump), pinned-new quality
+  == independent window (onset 0.542 vs 0.554), flat RMS over a 4-window chain (no
+  drift). User A/B'd `roll_continuous.wav` vs `roll_windowed.wav` → "way way better".
+- **Live producer verified** (psig/Dubstep, W20, dn0.70, char0 == probe): peak 1.26,
+  onset_corr 0.579, max-jump 0.40, **0 underruns** at 1×, RMS rising with the song
+  (no drift) — matches the probe. Seamless max-jump on smooth material ~0.01–0.08
+  (vs windowed's seam spikes).
+- **Cost ≈ same** as windowed: per chunk it's still N forwards over the window;
+  pinning adds no forwards. Window/latency tradeoff: SMALL window (~8–10s) = snappy
+  control + cheap + still seamless (pin); LARGE window (20s) = more new-content
+  context per chunk but laggier control (committed runs ~hop ahead). Both seamless.
+  Recommend ~8–10s for live tweaking. (Follow-up for instant control: force a
+  re-roll from the playhead on control change.)
+- **Removed:** the interior-overlap-add + equal-power crossfade (`_emit`/`_emit_seam`,
+  `_tail`, `_xf_*`, `_margin_f`) — superseded by rolling. DCW gain-comp + adaptive
+  buffer + lazy tiler retained. Engine-only Python (no app rebuild; sidecar respawn).
+- **Note:** away.mp3 covers low-energy at most styles (song-dependent, pre-existing)
+  — test rolling on a song that covers well (psig) to hear the seamless benefit.
+
+## First-window style — 2-pass primed first chunk
+
+User: "the second window always sounds way better than the first 20s — the style
+doesn't take hold yet." Cause (CLAP, same source region on XL): a COLD independent
+generation styles ~2× weaker than a PINNED continuation (region[W:W+H] indep 0.042
+vs pinned 0.096). The rolling first chunk is cold (no styled predecessor); later
+chunks pin to styled output → stronger. Fix (uses the play-time prime budget, as
+the user suggested): the first chunk (and post-seek/loop) is **2-pass** — a quick
+cold pass yields a short prefix, then regenerate the chunk PINNED to it so the body
+gets the same continuation style-boost. `prime_s=2.0`. Verified: first 16s dubstep
+0.042→0.099 (steady 0.140; body ≈ steady), 0 underruns. Only the literal first ~2s
+stays cold (nothing before frame 0 to pin) — trimmable if desired. Engine-only.
+
+## Control latency in the rolling engine (Amount/Character take effect fast)
+
+User: big Amount/Character jumps sometimes took a long time. Cause: the producer
+generates a whole hop ahead (up to ~16s @ win20) with the OLD settings; a change
+only affects future chunks → that old-setting latent plays first (variable with the
+gen cycle = "sometimes"). Fix (`_produce`): on a re-style control, discard the
+un-decoded generated-ahead and regenerate from the decode point with the new
+settings (pinned to the decoded past → smooth, no gap; invalidate decoded-ahead
+tiles too). Latency then = the inherent buffer depth: ~5s @ win20, ~1.5s @ win10
+(was up to ~16s); 0 underruns. **Use a smaller Window for snappier control.**
+Future option for near-instant: also flush the ring + re-roll from the playhead
+(brief gap per tweak) — deferred.
+
+## Prompt enhancer (✨) — short style → rich caption via the 5Hz LM
+
+User: "my text prompts almost never land." Integrated ACE-Step's prompt LM
+(`acestep-5Hz-lm-0.6B`, ~1.2 GB, MPS via transformers) using `format_sample` —
+"tech house" → "An energetic, driving electronic track... punchy four-on-the-floor
+kick... deep resonant synth bassline...". ACE-Step-1.5 and DEMON both ship an
+`acestep` package, so the LM runs in a SEPARATE process: `sidecar/enhancer.py`
+(sys.path=ACE-Step-1.5, lazy LM load, JSON-line stdin/stdout, stdout kept clean).
+Sidecar spawns it lazily, `_ensure_lm()` downloads w/ progress, `_do_enhance()`
+runs off-thread → "enhancing"/"enhanced" events (handled BEFORE the rc-None guard
+so it works with no track loaded). C++ `enhance(tags)` + native fn; JS ✨ button
+next to Style fills the box + applies. Verified end-to-end over the socket.
+Runtime dep: ACE-Step-1.5 repo (env ACE15_ACESTEP15) — bundle for distribution.
+
 ## Remaining to ship (packaging/polish — no model/DSP risk left)
 1. **Bundle a private Python + torch into the .app** (python-build-standalone +
    vendored wheels) so it runs with no dev venv; spawn the embedded interpreter.

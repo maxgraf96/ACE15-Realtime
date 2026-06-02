@@ -38,16 +38,19 @@ public:
     void uploadAudio(const juce::String& base64, const juce::String& ext);
     void setStyle(const juce::String& tags, double denoise, double character);
     void setPrompt(const juce::String& tags);
+    void enhance(const juce::String& tags);   // rewrite a short style into a rich caption (5Hz LM)
     void setDenoise(double v);
     void setCharacter(double v);
-    void setMetas(bool sendBpm, bool sendKey);   // inject detected tempo/key into the prompt?
+    void setMetas(bool sendBpm, bool sendKey, const juce::String& bpm, const juce::String& key);   // tempo/key flags + (edited) values
     void setEvolve(bool on);
     void setDcw(bool on);   // wavelet-domain per-step correction (DCW) on/off
     void seek(double fraction);   // jump playback to a fractional position (0..1)
     void reconfigure(int steps, double window);
     void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track
-    void play();
-    void stop();
+    void play();    // play / resume (keeps position)
+    void pause();   // pause — keep position
+    void stop();    // full stop — reset to the start
+    void setBypass(bool on);   // A/B: hear the original source instead of the cover (instant)
     bool engineConnected() const { return ipc.isConnected(); }
 
     // Editor sets this to receive engine EVENTs (on the message thread).
@@ -63,6 +66,7 @@ private:
     bool sidecarSpawned = false;
     juce::String selectedModel { "quality" };  // default XL; "fast"(2B) / "quality"(XL)
     bool sendBpm { true }, sendKey { true };   // inject detected tempo/key into prompt Metas
+    juce::String metaBpm, metaKey;             // user-edited tempo/key (empty = use auto-detected)
     bool dcwEnabled { false };              // DCW correction; off by default (runs hot in our regime)
     juce::var lastLoad;                      // last load message, for model-change reload
 
