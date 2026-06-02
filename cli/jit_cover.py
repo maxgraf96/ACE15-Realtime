@@ -23,8 +23,8 @@ def main():
     ap.add_argument("--src", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "source.wav"))
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--style", default="8-bit chiptune, square wave synth lead")
-    ap.add_argument("--window", type=float, default=10.0)
-    ap.add_argument("--lookahead", type=float, default=1.0)
+    ap.add_argument("--window", type=float, default=20.0)   # bigger window = more coherent; JIT decouples it from latency
+    ap.add_argument("--lookahead", type=float, default=1.0)  # lazy tile decode: regen spike = gen + 1 tile (~1s) -> ~1s control latency
     ap.add_argument("--slice", type=float, default=1.0)
     ap.add_argument("--denoise", type=float, default=0.8)
     ap.add_argument("--steps", type=int, default=8)

@@ -88,6 +88,37 @@ def patch_apg_fp32() -> None:
     ode_steps.apg_project = apg_project
 
 
+def force_bf16_on_mps() -> None:
+    """Make ModelContext load the DiT (and conditioning/latents) in bf16 on MPS.
+
+    DEMON forces fp32 on non-CUDA (model_context.py:164). That's fine for the
+    2B model but doubles the XL model to ~40 GB and OOMs. bf16 keeps XL ~20 GB
+    and (per Phase 0) costs no speed on MPS. Opt-in: only the XL test calls this;
+    the shipped 2B app stays fp32. Idempotent.
+    """
+    import torch
+    _add_demon_to_path()   # ensure acestep importable even if install() hasn't run yet
+    from acestep.engine.model_context import ModelContext
+
+    if getattr(ModelContext, "_bf16_mps_patched", False):
+        return
+    orig_place = ModelContext._place_dit
+
+    def _place(self, skip_decoder):
+        # bf16 ONLY for the big XL checkpoint (else fp32 -> ~40GB OOM). 2B stays
+        # fp32 (what we tuned/shipped). Safe to leave this patch always on.
+        name = ""
+        cfg = getattr(self.model, "config", None)
+        if cfg is not None:
+            name = str(getattr(cfg, "_name_or_path", ""))
+        if str(self.device) == "mps" and "xl" in name.lower():
+            self.dtype = torch.bfloat16   # set BEFORE _place_dit + later vae/text/silence casts
+        return orig_place(self, skip_decoder)
+
+    ModelContext._place_dit = _place
+    ModelContext._bf16_mps_patched = True
+
+
 def mps_sync() -> None:
     """Flush the MPS command queue so timings measure real GPU work."""
     import torch

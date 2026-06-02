@@ -4,6 +4,10 @@ __pycache__/
 *.pyc
 *.egg-info/
 
+# Build (CMake out-of-source; contains the fetched JUCE git clone)
+build/
+app/build/
+
 # Models / large assets (downloaded, not committed)
 models/
 assets/*.wav

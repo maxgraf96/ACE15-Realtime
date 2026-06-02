@@ -23,13 +23,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import mps_compat  # installs shims on import
+from . import mps_compat
+mps_compat.install()  # add DEMON to sys.path + cuda/grad shims, for ANY importer (sidecar, tests, app)
 
 import torch  # noqa: E402
 
 FPS = 25.0
 SR = 48000
 SPF = 1920  # samples per latent frame
+SEM_PATCH = 5  # semantic tokenizer patch (25 fps -> 5 Hz); source latent T must be a multiple
 
 
 @dataclass
@@ -66,38 +68,147 @@ def _eq(n, device, dtype):
 
 
 class JITCover:
-    def __init__(self, device="mps", steps=8, shift=3.0):
+    def __init__(self, device="mps", steps=8, shift=3.0, config_path="acestep-v15-turbo"):
         from acestep.engine.session import Session
         self.session = Session(device=device, decoder_backend="eager", vae_backend="eager",
-                               use_flash_attention=False, vae_window=0.0)
+                               use_flash_attention=False, vae_window=0.0, config_path=config_path)
         self.steps = steps; self.shift = shift
         self.source = None; self.cond = None; self.handle = None
         self.track_dur = 0.0; self.denoise = 0.8
+        # character 0..1: 0 = full style (no source timbre), 1 = keep source character
+        self.character = 0.0
+        self.evolve = False; self._regen = 0
+        self.tags = ""
+        self.send_bpm = True; self.send_key = True   # inject detected tempo/key into Metas
+        # Lyrics: EMPTY measured stronger style than "[Instrumental]" for the cover task
+        # (funk CLAP 0.22 vs 0.14) — the source structure already implies instrumental.
+        self.lyrics = ""
+        self.peaks: list = []
+        self.bpm = 120; self.key = "C major"   # auto-detected in load_track
 
-    def load_track(self, path, seconds=None):
+    def load_track(self, path, seconds=None, detect=True):
         from . import loader
         a = loader.load_audio(path, duration=seconds)
         self.track_dur = a.waveform.shape[-1] / SR
-        self.source = self.session.prepare_source(a)
+        if detect:
+            # Match the source's real tempo/key so the text metadata agrees with
+            # the structure conditioning (a mismatch makes the cover incoherent).
+            try:
+                from acestep.nodes.audio_nodes import AudioInfo
+                info = AudioInfo().execute(audio=a)
+                self.bpm, self.key = int(info["bpm"]), str(info["key"])
+                print(f"[jit] detected bpm={self.bpm} key={self.key}")
+            except Exception as e:
+                print(f"[jit] bpm/key detect failed ({e}); using {self.bpm}/{self.key}")
+        # The semantic tokenizer patchifies T into groups of SEM_PATCH (5), so the
+        # source latent length MUST be a multiple of 5 or extract_hints rearrange
+        # fails. Encode, truncate to a multiple, then extract hints.
+        from acestep.nodes.types import Latent
+        from acestep.engine.session import PreparedSource
+        lat = self.session.encode_audio(a)
+        T = lat.tensor.shape[1]
+        T5 = max(SEM_PATCH, (T // SEM_PATCH) * SEM_PATCH)
+        if T5 != T:
+            lat = Latent(tensor=lat.tensor[:, :T5, :].contiguous())
+            print(f"[jit] latent T {T} -> {T5} (multiple of {SEM_PATCH})")
+        ctx = self.session.extract_hints(lat)
+        self.source = PreparedSource(latent=lat, context_latent=ctx)
+        self.peaks = self._compute_peaks(a.waveform, 220)
         return self
 
-    def set_style(self, tags, denoise=0.8, bpm=120, key="C major"):
+    @staticmethod
+    def _compute_peaks(wav, n):
+        """Downsample |mono| to n peak bars in [0,1] for the UI waveform."""
+        import torch as _t
+        x = wav.float().abs().mean(0)
+        if x.numel() == 0:
+            return []
+        step = max(1, x.numel() // n)
+        p = _t.nn.functional.max_pool1d(x.view(1, 1, -1), step, step).flatten()
+        m = float(p.max()) or 1.0
+        return [round(float(v) / m, 4) for v in p[:n]]
+
+    def _refer(self):
+        """Timbre reference latent for the current Character (0=style, 1=source)."""
+        c = self.character
+        if c <= 0.01:
+            return None                       # full style (CLAP-tuned default)
+        if c >= 0.99:
+            return self.source.latent         # keep source character
+        from acestep.nodes.types import Latent
+        h = self.session.handler
+        h._ensure_silence_latent_on_device()
+        T = self.source.latent.tensor.shape[1]
+        sil = h.silence_latent
+        if sil.shape[1] < T:
+            sil = sil.repeat(1, (T + sil.shape[1] - 1) // sil.shape[1], 1)
+        sil = Latent(tensor=sil[:, :T, :].to(self.source.latent.tensor))
+        return self.session.blend_latents(sil, self.source.latent, alpha=c)  # 0=silence,1=source
+
+    def _encode(self):
+        # Build the ACE-Step cover prompt ourselves so we can OMIT bpm/key
+        # (they're optional soft guidance) and signal an instrumental cover via
+        # [Instrumental] lyrics — per the ACE-Step prompting guide. Caption =
+        # style/instruments/timbre only (NEVER tempo/key — those go in Metas).
         from acestep.constants import TASK_INSTRUCTIONS
+        from acestep.nodes.types import TextEmbed
+        from acestep.nodes.cond_nodes import EncodeConditioning
+        h = self.session.handler
+        device = h.device
+        metas = []
+        if self.send_bpm:
+            metas.append(f"- bpm: {self.bpm}")
+        metas.append("- timesignature: 4")
+        if self.send_key:
+            metas.append(f"- keyscale: {self.key}")
+        metas.append(f"- duration: {self.track_dur}")
+        text_prompt = (f"# Instruction\n{TASK_INSTRUCTIONS['cover']}\n\n"
+                       f"# Caption\n{self.tags}\n\n# Metas\n" + "\n".join(metas) + "\n<|endoftext|>\n")
+        lyrics_prompt = f"# Languages\nen\n\n# Lyric\n{self.lyrics}<|endoftext|><|endoftext|>"
+        with h._load_model_context("text_encoder"):
+            t = h.text_tokenizer(text_prompt, return_tensors="pt", add_special_tokens=False)
+            text_hidden = h.infer_text_embeddings(t["input_ids"].to(device))
+            text_mask = t["attention_mask"].to(device).bool()
+            lt = h.text_tokenizer(lyrics_prompt, return_tensors="pt", add_special_tokens=False)
+            lyric_hidden = h.infer_lyric_embeddings(lt["input_ids"].to(device))
+            lyric_mask = torch.ones(lyric_hidden.shape[:2], device=device, dtype=torch.bool)
+        te = TextEmbed(text_hidden_states=text_hidden, text_attention_mask=text_mask,
+                       lyric_hidden_states=lyric_hidden, lyric_attention_mask=lyric_mask)
+        self.cond = EncodeConditioning().execute(
+            model=self.session.model, text_embed=te, timbre_ref=self._refer())["conditioning"]
+        if self.handle is not None:
+            self.handle.conditioning = self.cond
+
+    def set_metas(self, send_bpm=None, send_key=None):
+        if send_bpm is not None: self.send_bpm = bool(send_bpm)
+        if send_key is not None: self.send_key = bool(send_key)
+        self._encode()
+
+    def set_style(self, tags, denoise=0.8, character=None, bpm=None, key=None, timbre=None,
+                  send_bpm=None, send_key=None):
         self.denoise = denoise
-        self.cond = self.session.encode_text(tags=tags, instruction=TASK_INSTRUCTIONS["cover"],
-                                             refer_latent=self.source.latent, duration=self.track_dur, bpm=bpm, key=key)
+        self.tags = tags
+        if character is not None:
+            self.character = float(character)
+        elif timbre is not None:                          # back-compat: "source"/"none"
+            self.character = 1.0 if timbre == "source" else 0.0
+        if bpm is not None: self.bpm = bpm
+        if key is not None: self.key = key
+        if send_bpm is not None: self.send_bpm = bool(send_bpm)
+        if send_key is not None: self.send_key = bool(send_key)
+        self._encode()
         if self.handle is None:
             self.handle = self.session.stream(source=self.source, conditioning=self.cond,
                                               steps=self.steps, shift=self.shift, pipeline_depth=1, dcw_enabled=False)
-        else:
-            self.handle.conditioning = self.cond
         return self
 
-    def _set_prompt(self, tags, bpm=120, key="C major"):
-        from acestep.constants import TASK_INSTRUCTIONS
-        self.cond = self.session.encode_text(tags=tags, instruction=TASK_INSTRUCTIONS["cover"],
-                                             refer_latent=self.source.latent, duration=self.track_dur, bpm=bpm, key=key)
-        self.handle.conditioning = self.cond
+    def _set_prompt(self, tags):
+        self.tags = tags
+        self._encode()
+
+    def set_character(self, c):
+        self.character = float(c)
+        self._encode()
 
     def _gen(self, w0, w1, seed):
         from acestep.nodes.types import Latent
@@ -106,28 +217,42 @@ class JITCover:
         ctx = self.source.context_latent.tensor[:, w0:w1, :]
         self.handle.context_latent = Latent(tensor=ctx)
         self.handle.source = PreparedSource(latent=Latent(tensor=src), context_latent=Latent(tensor=ctx))
-        lat = self.handle.tick(drain=True, denoise=self.denoise, seed=seed)
+        eff_seed = seed + (self._regen if self.evolve else 0)   # Evolve: browse new variations
+        self._regen += 1
+        lat = self.handle.tick(drain=True, denoise=self.denoise, seed=eff_seed)
         mps_compat.mps_sync()
         return lat
 
-    def _full_decode(self, lat, chunk=64, overlap=8):
-        """Full tiled decode of a window latent -> [2, T*SPF] on CPU (cached)."""
+    # Lazy tiled decode: decode only the latent tiles needed for the frames the
+    # playhead is reaching, cached per window. A regen then costs gen + ONE tile
+    # (~0.15 s) instead of a full-window decode (~0.9 s), so control latency
+    # (>= regen spike) drops accordingly. Overlap-discard tiling is seamless and
+    # bit-matches a full decode (same as the old _full_decode).
+    _TILE = 48          # kept frames per tile (1.92 s)
+    _TOV = 8            # receptive-field margin frames each side
+
+    def _ensure_tiles(self, lat, cache, a, b):
+        """Decode any tiles covering local frames [a,b); return audio [2,(b-a)*SPF]."""
         vae = self.session.handler.vae
         lb = lat.tensor.transpose(1, 2)
-        T = lb.shape[-1]
+        Wl = lb.shape[-1]
+        a = max(0, a); b = min(Wl, b)
+        t0, t1 = a // self._TILE, (b - 1) // self._TILE
         with self.session.handler._load_model_context("vae"):
-            if T <= chunk:
-                return vae.decode(lb.to(vae.dtype)).sample.float().squeeze(0).cpu()
-            stride = chunk - 2 * overlap
-            out, pos = [], 0
-            while pos < T:
-                lo, hi = max(0, pos - overlap), min(T, pos + stride + overlap)
-                w = vae.decode(lb[..., lo:hi].to(vae.dtype)).sample.float()
-                tl = (pos - lo) * SPF
-                tr = (hi - min(T, pos + stride)) * SPF
-                out.append(w[..., tl: w.shape[-1] - tr if tr else None])
-                pos += stride
-        return torch.cat(out, dim=-1).squeeze(0).cpu()
+            for t in range(t0, t1 + 1):
+                if t in cache:
+                    continue
+                ks, ke = t * self._TILE, min((t + 1) * self._TILE, Wl)
+                ds, de = max(0, ks - self._TOV), min(Wl, ke + self._TOV)
+                w = vae.decode(lb[..., ds:de].to(vae.dtype)).sample.float()
+                tl, tr = (ks - ds) * SPF, (de - ke) * SPF
+                cache[t] = w[..., tl: w.shape[-1] - tr if tr else None].squeeze(0).cpu()
+        parts = []
+        for t in range(t0, t1 + 1):
+            ks, ke = t * self._TILE, min((t + 1) * self._TILE, Wl)
+            lo, hi = max(a, ks) - ks, min(b, ke) - ks
+            parts.append(cache[t][:, lo * SPF: hi * SPF])
+        return torch.cat(parts, dim=-1)
 
     def render(self, controls=None, window_s=10.0, lookahead_s=1.0, slice_s=1.0,
                xfade_s=0.12, seed=1234) -> tuple:
@@ -151,7 +276,9 @@ class JITCover:
         out = None
         committed_f = 0                   # output frames committed (playback trails by lookahead)
         win_start = -10 ** 9
-        win_audio = None                  # full-decoded current window [2, Wlat*SPF] (cached on CPU)
+        win_lat = None                    # current window latent
+        win_tiles: dict = {}              # lazily-decoded tiles for win_lat (CPU)
+        win_nf = 0                        # window length in latent frames
         force = False
 
         def append(wav, xf):
@@ -176,31 +303,36 @@ class JITCover:
                 force = True
                 st.control_latency_s.append(lookahead_s)
 
-            # (re)generate + FULL-decode the window when we leave it or a control fired
-            win_end = win_start + (0 if win_audio is None else win_audio.shape[-1] // SPF)
-            if win_audio is None or committed_f >= win_end or force:
+            # (re)generate the window when we leave it or a control fired. The
+            # window is decoded LAZILY tile-by-tile, so a regen blocks only on
+            # gen + the first tile, not a full-window decode.
+            if win_lat is None or committed_f >= win_start + win_nf or force:
                 back = XF_f if out is not None else 0
                 win_start = max(0, min(committed_f - back, full_T - W))
                 g0 = time.perf_counter()
-                lat = self._gen(win_start, min(win_start + W, full_T), seed)
-                st.gen_ms.append((time.perf_counter() - g0) * 1000)
-                d0 = time.perf_counter()
-                win_audio = self._full_decode(lat)
-                st.dec_ms.append((time.perf_counter() - d0) * 1000)
+                win_lat = self._gen(win_start, min(win_start + W, full_T), seed)
+                win_nf = win_lat.tensor.shape[1]
+                win_tiles = {}
+                gen_ms = (time.perf_counter() - g0) * 1000
+                st.gen_ms.append(gen_ms)
                 st.regens += 1
-                st.max_step_ms = max(st.max_step_ms, st.gen_ms[-1] + st.dec_ms[-1])
                 force = False
-                # emit the crossfade-overlap slice straight away (from back-of-committed)
                 from_f = committed_f - back
-                seg = win_audio[:, (from_f - win_start) * SPF: (min(committed_f + SL, win_start + win_audio.shape[-1] // SPF, full_T) - win_start) * SPF]
+                f1 = min(committed_f + SL, win_start + win_nf, full_T)
+                d0 = time.perf_counter()
+                seg = self._ensure_tiles(win_lat, win_tiles, from_f - win_start, f1 - win_start)
+                mps_compat.mps_sync()
+                dec_ms = (time.perf_counter() - d0) * 1000
+                st.dec_ms.append(dec_ms)
+                st.max_step_ms = max(st.max_step_ms, gen_ms + dec_ms)  # the regen spike that sets min lookahead
                 append(seg, XF if back else 0)
                 committed_f = from_f + seg.shape[-1] // SPF
                 mps_compat.reclaim()
                 continue
 
-            # steady: copy the next slice from the cached window decode (free, full quality)
-            f1 = min(committed_f + SL, win_end, full_T)
-            seg = win_audio[:, (committed_f - win_start) * SPF: (f1 - win_start) * SPF]
+            # steady: decode (or reuse cached) the next slice's tiles, full quality
+            f1 = min(committed_f + SL, win_start + win_nf, full_T)
+            seg = self._ensure_tiles(win_lat, win_tiles, committed_f - win_start, f1 - win_start)
             append(seg, 0)
             committed_f = f1
 

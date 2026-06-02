@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ACE15 · Realtime</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="hl">
+    <header class="top">
+      <div class="brand">
+        <h1>ACE15</h1>
+        <span class="tag">Realtime cover</span>
+      </div>
+      <div class="status" id="status">
+        <span class="dot"></span>
+        <span id="status-text">starting engine…</span>
+      </div>
+    </header>
+
+    <div class="error-banner" id="error-banner" hidden>
+      <span class="error-text" id="error-text"></span>
+      <button type="button" class="error-dismiss" id="error-dismiss" aria-label="Dismiss">×</button>
+    </div>
+
+    <div class="dl" id="dl" hidden>
+      <div class="dl-label" id="dl-label">Downloading models (first run)…</div>
+      <div class="dlbar"><div class="dlbar-fill" id="dl-fill"></div></div>
+    </div>
+
+    <input type="file" id="file-picker" hidden
+           accept="audio/wav,audio/aiff,audio/flac,audio/mpeg,.wav,.aiff,.aif,.flac,.mp3,.ogg" />
+
+    <div class="body">
+    <div class="col col-left">
+      <section class="source empty" id="source">
+        <div class="source-empty" id="source-empty">
+          <div class="drophint"><b>Drop</b> a track, or <b>browse&hairsp;…</b></div>
+          <div class="formats">WAV · AIFF · FLAC · MP3</div>
+        </div>
+        <div class="source-loaded" id="source-loaded" hidden>
+          <div class="srcname">
+            <b id="srcname-text"></b>
+            <span id="srcdur-text" class="srcdur"></span>
+            <span id="bpmkey" class="detected"></span>
+          </div>
+          <div class="srcwave" id="srcwave"></div>
+        </div>
+      </section>
+
+      <section class="meter" id="meter" hidden>
+        <div class="meter-row">
+          <span class="meter-lbl">buffer</span><span class="meter-val" id="m-buf">–</span>
+          <span class="meter-lbl">regens</span><span class="meter-val" id="m-regens">–</span>
+          <span class="meter-lbl">worst</span><span class="meter-val" id="m-lat">–</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="col col-right">
+      <section class="controls" id="controls">
+        <div class="row">
+          <span class="lbl">Style</span>
+          <input type="text" id="prompt" placeholder="e.g. lo-fi hip hop, warm Rhodes" />
+          <button type="button" class="prompt-clear mode-toggle" id="prompt-clear" hidden
+                  title="Clear Style" aria-label="Clear style">×</button>
+        </div>
+
+        <div class="row">
+          <span class="lbl">Amount</span>
+          <input type="range" id="denoise" min="0.40" max="0.95" step="0.01" value="0.70"
+                 title="Structure ↔ style. Low keeps the source's groove/harmony; high follows the prompt. Real songs usually want 0.5–0.65." />
+          <span class="val" id="denoise-value">0.70</span>
+        </div>
+
+        <div class="row">
+          <span class="lbl">Character</span>
+          <input type="range" id="character" min="0.00" max="1.00" step="0.01" value="0.00"
+                 title="0 = full restyle · 1 = keep the source's own instrument/voice character" />
+          <span class="val" id="character-value">0.00</span>
+        </div>
+
+        <div class="row">
+          <span class="lbl">Steps</span>
+          <input type="range" id="steps" min="4" max="12" step="1" value="8"
+                 title="Diffusion steps per window. Fewer = snappier control; more = cleaner. Restarts on change." />
+          <span class="val" id="steps-value">8</span>
+        </div>
+
+        <div class="row">
+          <span class="lbl">Window</span>
+          <input type="number" id="window" class="numfield" min="6" max="30" step="1" value="20"
+                 title="Generation window (s). Larger = more coherent. Restarts on change." />
+          <div style="flex:1"></div>
+          <span class="val">sec</span>
+        </div>
+
+        <div class="row toggle-row">
+          <span class="lbl">Match</span>
+          <button type="button" class="mode-toggle one-shot" id="bpm-toggle"
+                  title="Inject the detected tempo into the prompt. Off = let the model pick the tempo (useful if BPM detection looks wrong).">Tempo</button>
+          <button type="button" class="mode-toggle one-shot" id="key-toggle"
+                  title="Inject the detected key into the prompt. Off = let the model pick the key.">Key</button>
+          <div style="flex:1"></div>
+        </div>
+
+        <div class="row toggle-row">
+          <span class="lbl">Mode</span>
+          <button type="button" class="mode-toggle" id="evolve-toggle"
+                  title="Coherent = fixed seed (one stable remix). Evolve = new variations as it loops.">Coherent</button>
+          <div style="flex:1"></div>
+        </div>
+
+        <div class="row toggle-row">
+          <span class="lbl">Model</span>
+          <button type="button" class="mode-toggle one-shot" id="model-toggle"
+                  title="Quality = XL (richer style transfer, ~2s latency; +20 GB on first use). Fast = 2B (low latency, ~1s).">Quality</button>
+          <div style="flex:1"></div>
+        </div>
+
+        <button type="button" class="gen" id="play" disabled>
+          <span class="gen-label" id="play-label">Play</span>
+        </button>
+      </section>
+    </div>
+    </div>
+
+    <footer class="footer">
+      <span class="kbd-hint">
+        <kbd>Space</kbd> play/stop · type a <b>Style</b> and it restyles live in ~1 s · ride <b>Amount</b> (source → styled)
+      </span>
+      <button type="button" class="mode-toggle" id="reset" title="Reset Amount / Character / Mode">Reset</button>
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
