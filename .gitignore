@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Models / large assets (downloaded, not committed)
+models/
+assets/*.wav
+assets/*.flac
+assets/*.mp3
+
+# Generated audio + scratch
+test_output/
+*.wav
+!notes/**/*.wav
+
+# OS
+.DS_Store
