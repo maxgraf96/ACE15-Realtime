@@ -96,10 +96,25 @@ def mps_sync() -> None:
         torch.mps.synchronize()
 
 
+def _disable_grad() -> None:
+    """Inference-only engine: disable autograd globally.
+
+    The DiT/VAE/text-encoder params load with requires_grad=True, so any forward
+    NOT wrapped in no_grad builds + retains an autograd graph. The StreamPipeline
+    tick has its own @torch.no_grad, but the VAE decode path does not — under a
+    long streaming session that retained-graph memory balloons into a hard MPS
+    OOM (observed: 61 GiB into swap). We never train, so kill grad process-wide.
+    """
+    import torch
+
+    torch.set_grad_enabled(False)
+
+
 def install(*, patch_apg: bool = True) -> None:
     """Apply all shims. Safe to call multiple times."""
     _add_demon_to_path()
     _noop_cuda()
+    _disable_grad()
     if patch_apg:
         # ode_steps import is cheap and pulls in no heavy deps.
         try:
