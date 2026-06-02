@@ -20,6 +20,8 @@ const setPrompt   = nf("setPrompt");
 const setDenoise  = nf("setDenoise");
 const setChar     = nf("setCharacter");
 const setEvolve   = nf("setEvolve");
+const setDcw      = nf("setDcw");
+const seekFn      = nf("seek");
 const reconfigure = nf("reconfigure");
 const setModel    = nf("setModel");
 const setMetas    = nf("setMetas");
@@ -31,6 +33,7 @@ const openFile    = nf("openFile");
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status"), statusText = $("status-text");
 const sourceEl = $("source"), sourceEmpty = $("source-empty"), sourceLoaded = $("source-loaded");
+const sourceLoading = $("source-loading"), loadName = $("loadname-text"), loadStage = $("loadstage-text");
 const srcName = $("srcname-text"), srcDur = $("srcdur-text"), bpmkey = $("bpmkey"), srcWave = $("srcwave");
 const meterEl = $("meter"), mBuf = $("m-buf"), mRegens = $("m-regens"), mLat = $("m-lat");
 const promptEl = $("prompt"), promptClear = $("prompt-clear");
@@ -45,9 +48,22 @@ const filePicker = $("file-picker");
 
 let loaded = false, styled = false, playing = false, evolve = false;
 let playheadEl = null;
+let trackDur = 0;   // seconds, for the m:ss position readout
 
 function setStatus(t, cls) { statusText.textContent = t; statusEl.className = "status" + (cls ? " " + cls : ""); }
 function refresh() { playBtn.disabled = !(loaded && styled); }
+function fmtTime(s) { s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
+function showPos(frac) { if (trackDur) srcDur.textContent = fmtTime(frac * trackDur) + " / " + fmtTime(trackDur); }
+
+// ── loading state (drop/model-switch → ready) ────────────────────────
+function setStage(t) { loadStage.textContent = t; }
+function showLoading(name) {
+  loadName.textContent = name; setStage("loading…");
+  sourceEl.classList.remove("empty");
+  sourceEmpty.hidden = true; sourceLoaded.hidden = true; meterEl.hidden = true;
+  sourceLoading.hidden = false;
+}
+function hideLoading() { sourceLoading.hidden = true; }
 
 // ── waveform (adapted from plugin_morph) ─────────────────────────────
 function mountWaveform(el, peaks) {
@@ -62,8 +78,31 @@ function mountWaveform(el, peaks) {
        <path d="${d}" fill="currentColor" fill-opacity="0.7"/>
      </svg><div class="playhead" style="position:absolute;top:0;bottom:0;width:1px;background:var(--accent);left:0%"></div>`;
   el.style.position = "relative";
+  el.style.cursor = "pointer";
   playheadEl = el.querySelector(".playhead");
 }
+
+// ── scrub: click/drag the waveform to jump through the track ──────────
+// Drag moves the playhead visually; we seek on release (each seek triggers a
+// regen, so we don't flood the engine while dragging). After a seek we briefly
+// ignore engine playhead updates so the head doesn't snap back before the
+// producer catches up at the new position.
+let scrubbing = false, scrubHoldUntil = 0;
+function scrubFrac(e) {
+  const r = srcWave.getBoundingClientRect();
+  return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+}
+function showHead(frac) { if (playheadEl) playheadEl.style.left = (frac * 100).toFixed(2) + "%"; showPos(frac); }
+srcWave.addEventListener("pointerdown", (e) => {
+  if (!loaded) return;
+  scrubbing = true; srcWave.setPointerCapture(e.pointerId); showHead(scrubFrac(e)); e.preventDefault();
+});
+srcWave.addEventListener("pointermove", (e) => { if (scrubbing) showHead(scrubFrac(e)); });
+srcWave.addEventListener("pointerup", (e) => {
+  if (!scrubbing) return;
+  const f = scrubFrac(e); showHead(f); seekFn(f);
+  scrubbing = false; scrubHoldUntil = performance.now() + 600;   // let the engine catch up
+});
 
 // ── load (drag-drop / picker) ────────────────────────────────────────
 function fileToBase64(file) {
@@ -79,8 +118,9 @@ function fileToBase64(file) {
   });
 }
 async function loadFile(file) {
-  setStatus("loading track…", "accent");
+  showLoading(file.name);
   srcName.textContent = file.name;
+  setStatus("loading track…", "accent");
   const ext = "." + (file.name.split(".").pop() || "wav").toLowerCase();
   const b64 = await fileToBase64(file);
   await uploadAudio(b64, ext);
@@ -126,6 +166,17 @@ evolveEl.addEventListener("click", () => {
   evolveEl.classList.toggle("one-shot", evolve); setEvolve(evolve);
 });
 
+// DCW: opt-in wavelet-domain correction. Live setter (queued -> regen) when
+// playing; otherwise re-style so the next handle is built in the new DCW state.
+let dcw = false;  // DCW off by default (it runs hot in our regime; opt-in via the toggle)
+const dcwEl = $("dcw-toggle");
+dcwEl.addEventListener("click", () => {
+  dcw = !dcw; dcwEl.textContent = dcw ? "DCW On" : "DCW Off";
+  dcwEl.classList.toggle("one-shot", dcw);
+  setDcw(dcw);                            // updates native state (+ live regen if playing)
+  if (!playing && styled) applyStyle();  // not playing: rebuild the handle in the new DCW state
+});
+
 // Match tempo/key toggles (inject detected bpm/key into the prompt Metas)
 let sendBpm = true, sendKey = true;
 const bpmToggle = $("bpm-toggle"), keyToggle = $("key-toggle");
@@ -143,6 +194,7 @@ modelEl.addEventListener("click", () => {
   modelEl.textContent = model === "quality" ? "Quality" : "Fast";
   modelEl.classList.toggle("one-shot", model === "quality");
   styled = false; refresh();
+  if (loaded) { showLoading(srcName.textContent || "track"); setStage("loading model…"); }  // reload = same wait as a drop
   setStatus(model === "quality" ? "loading Quality (XL)…" : "loading Fast (2B)…", "accent");
   setModel(model);   // C++ reloads the current track on the new model (downloads XL on first use)
 });
@@ -167,16 +219,24 @@ document.addEventListener("keydown", (e) => {
 window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
   if (!ev || typeof ev !== "object") return;
   switch (ev.event) {
+    case "loading":   // engine stage updates while a track loads (drop → ready)
+      if (ev.stage === "model") setStage("loading model…");
+      else if (ev.stage === "analyze") setStage("analyzing track…");
+      break;
     case "loaded":
       loaded = true;
-      sourceEl.classList.remove("empty"); sourceEmpty.hidden = true; sourceLoaded.hidden = false; meterEl.hidden = false;
-      srcDur.textContent = ev.duration ? ev.duration.toFixed(1) + "s" : "";
-      mountWaveform(srcWave, (ev.peaks || []).map(Number));
+      sourceEl.classList.remove("empty");
+      trackDur = ev.duration || 0; showPos(0);   // "0:00 / m:ss"
+      mountWaveform(srcWave, (ev.peaks || []).map(Number));   // into (still-hidden) sourceLoaded
+      setStage("preparing…");
       setStatus("applying style…", "accent");
       applyStyle();                       // create the handle -> "styled"
       break;
     case "styled":
       styled = true; bpmkey.textContent = `${ev.bpm} BPM · ${ev.key}`;
+      if (!sourceLoading.hidden) {         // first styled after a (re)load -> reveal the ready track
+        hideLoading(); sourceEmpty.hidden = true; sourceLoaded.hidden = false; meterEl.hidden = false;
+      }
       refresh();
       if (playing) play();   // resume after a model/track reload (new engine starts stopped)
       setStatus(playing ? "playing" : "ready — press Play");
@@ -186,14 +246,22 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       mBuf.textContent = (ev.buffered_s ?? 0).toFixed(1) + "s";
       mRegens.textContent = ev.regens ?? "–";
       mLat.textContent = (ev.worst_regen_ms ?? 0) + "ms";
-      if (playheadEl && typeof ev.progress === "number") playheadEl.style.left = (ev.progress * 100).toFixed(2) + "%";
+      if (!scrubbing && performance.now() > scrubHoldUntil && typeof ev.progress === "number") {
+        if (playheadEl) playheadEl.style.left = (ev.progress * 100).toFixed(2) + "%";
+        showPos(ev.progress);   // m:ss readout follows the playhead
+      }
       break;
     case "download_progress":
       dl.hidden = false; dlFill.style.width = (ev.pct || 0) + "%";
+      setStage(`downloading models ${Math.round(ev.pct)}%`);
       setStatus(`downloading models ${Math.round(ev.pct)}%`, "accent");
       if (ev.pct >= 100) setTimeout(() => { dl.hidden = true; }, 800);
       break;
-    case "error": errText.textContent = ev.msg || "error"; errBanner.hidden = false; setStatus("error", "error"); break;
+    case "error":
+      errText.textContent = ev.msg || "error"; errBanner.hidden = false; setStatus("error", "error");
+      hideLoading();                                  // don't strand the user on the spinner
+      if (!loaded) { sourceEmpty.hidden = false; sourceEl.classList.add("empty"); }
+      break;
   }
 });
 errDismiss.addEventListener("click", () => errBanner.hidden = true);

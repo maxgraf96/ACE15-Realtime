@@ -16,7 +16,27 @@ static inline float softClip(float x) noexcept
 ACE15Processor::ACE15Processor()
     : juce::AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
-    ipc.onEvent = [this](juce::var v) { if (onEngineEvent) onEngineEvent(v); };
+    ipc.onEvent = [this](juce::var v)
+    {
+        // The engine's stats "progress" is the position it has SENT; what's actually
+        // heard lags by the audio still sitting in our jitter ring. Subtract that so
+        // the playhead matches the speakers.
+        if (v.getProperty("event", {}).toString() == "stats")
+        {
+            if (auto* o = v.getDynamicObject())
+            {
+                const double dur = (double) o->getProperty("duration_s");
+                if (dur > 0.0)
+                {
+                    const double lag = ipc.framesAvailable() / (double) IpcClient::kStreamSampleRate;
+                    double p = (double) o->getProperty("progress") - lag / dur;
+                    if (p < 0.0) p = 0.0;   // near start/loop, heard pos not caught up — clamp (don't wrap to end)
+                    o->setProperty("progress", p);
+                }
+            }
+        }
+        if (onEngineEvent) onEngineEvent(v);
+    };
     ensureSidecar();
     // Connect in the background (sidecar may still be starting).
     juce::Thread::launch([this] { ipc.connect("127.0.0.1", 8765, 20000); });
@@ -138,6 +158,7 @@ void ACE15Processor::setStyle(const juce::String& tags, double denoise, double c
     m.getDynamicObject()->setProperty("character", character);
     m.getDynamicObject()->setProperty("send_bpm", sendBpm);
     m.getDynamicObject()->setProperty("send_key", sendKey);
+    m.getDynamicObject()->setProperty("dcw", dcwEnabled);   // start the handle in the right DCW state
     ipc.sendControl(m);
 }
 
@@ -175,6 +196,21 @@ void ACE15Processor::setEvolve(bool on)
 {
     auto m = makeMsg("evolve");
     m.getDynamicObject()->setProperty("value", on);
+    ipc.sendControl(m);
+}
+
+void ACE15Processor::setDcw(bool on)
+{
+    dcwEnabled = on;   // remembered so setStyle/reload re-applies it
+    auto m = makeMsg("dcw");
+    m.getDynamicObject()->setProperty("value", on);
+    ipc.sendControl(m);
+}
+
+void ACE15Processor::seek(double fraction)
+{
+    auto m = makeMsg("seek");
+    m.getDynamicObject()->setProperty("value", fraction);
     ipc.sendControl(m);
 }
 

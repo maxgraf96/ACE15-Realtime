@@ -57,6 +57,14 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.setEvolve((bool) args[0]); completion({});
           })
+          .withNativeFunction("setDcw", [this](auto args, auto completion)
+          {
+              processor.setDcw((bool) args[0]); completion({});
+          })
+          .withNativeFunction("seek", [this](auto args, auto completion)
+          {
+              processor.seek((double) args[0]); completion({});
+          })
           .withNativeFunction("reconfigure", [this](auto args, auto completion)
           {
               processor.reconfigure((int) args[0], (double) args[1]); completion({});

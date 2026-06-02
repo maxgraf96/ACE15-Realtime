@@ -127,6 +127,26 @@ def mps_sync() -> None:
         torch.mps.synchronize()
 
 
+_DCW_AVAILABLE: "bool | None" = None
+
+
+def dcw_available() -> bool:
+    """Whether DCW's wavelet backend (pytorch_wavelets) is importable.
+
+    DCW (acestep.engine.dcw) lazily imports pytorch_wavelets on first use; if it's
+    missing, a mid-tick enable would crash the producer thread. We probe once so
+    the engine can decline to enable DCW gracefully. Cached after the first check.
+    """
+    global _DCW_AVAILABLE
+    if _DCW_AVAILABLE is None:
+        try:
+            import pytorch_wavelets  # noqa: F401
+            _DCW_AVAILABLE = True
+        except Exception:
+            _DCW_AVAILABLE = False
+    return _DCW_AVAILABLE
+
+
 def _disable_grad() -> None:
     """Inference-only engine: disable autograd globally.
 
@@ -146,6 +166,10 @@ def install(*, patch_apg: bool = True) -> None:
     _add_demon_to_path()
     _noop_cuda()
     _disable_grad()
+    # pytorch_wavelets (DCW backend) imports the deprecated pkg_resources at import
+    # time and floods one UserWarning; silence just that one to keep logs clean.
+    import warnings
+    warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
     if patch_apg:
         # ode_steps import is cheap and pulls in no heavy deps.
         try:
@@ -154,4 +178,5 @@ def install(*, patch_apg: bool = True) -> None:
             print(f"[mps_compat] apg fp32 patch skipped: {e}")
 
 
-__all__ = ["install", "patch_apg_fp32", "mps_sync", "DEMON_ROOT"]
+__all__ = ["install", "patch_apg_fp32", "mps_sync", "dcw_available", "reclaim",
+           "force_bf16_on_mps", "DEMON_ROOT"]

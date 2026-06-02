@@ -12,6 +12,8 @@ CONTROL commands (JSON):
   {"cmd":"load","path":"<wav>","seconds":N}      # or {"cmd":"load","pcm_b64":...,"sr":...}
   {"cmd":"style","tags":"...","denoise":0.8,"timbre":"none"}
   {"cmd":"prompt","tags":"..."}     {"cmd":"denoise","value":0.7}
+  {"cmd":"dcw","value":true}        # wavelet-domain correction on/off (live)
+  {"cmd":"seek","value":0.5}        # jump to a fractional position (0..1)
   {"cmd":"play"}                    {"cmd":"stop"}
 
 The audio sender paces at 1x; the client buffers into its own jitter ring and
@@ -148,10 +150,12 @@ class Connection:
                     except Exception: pass
                     self.rc = None
                 self.playing = False
+                self._send_event({"event": "loading", "stage": "model"})   # loading weights into memory (slow, esp XL)
                 self.rc = RealtimeCover(device="mps", steps=msg.get("steps", 8),
                                         window_s=msg.get("window", 20.0),
                                         lookahead_s=msg.get("lookahead", 2.0 if model in ("quality", "xl") else 1.0),
                                         config_path=cfg)
+                self._send_event({"event": "loading", "stage": "analyze"})  # encode source + detect bpm/key
                 if msg.get("path"):
                     self.rc.load_track(msg["path"], seconds=msg.get("seconds"))
                 elif msg.get("file_b64"):           # drag-drop: raw encoded audio bytes
@@ -168,7 +172,11 @@ class Connection:
                 self._loaded = True
                 self._send_event({"event": "loaded", "duration": self.rc.full_T / 25.0,
                                   "peaks": self.rc.peaks(), "model": model})
+            elif self.rc is None:
+                return   # no track loaded yet — control commands no-op (UI re-sends state on load)
             elif cmd == "style":
+                if "dcw" in msg:                       # set before set_style builds the handle
+                    self.rc.jit.set_dcw(enabled=bool(msg["dcw"]))
                 self.rc.set_style(msg["tags"], denoise=msg.get("denoise", 0.8),
                                   character=msg.get("character", 0.0),
                                   send_bpm=msg.get("send_bpm", True), send_key=msg.get("send_key", True))
@@ -188,6 +196,10 @@ class Connection:
                 self.rc.set_metas(send_bpm=msg.get("send_bpm"), send_key=msg.get("send_key"))
             elif cmd == "evolve":
                 self.rc.set_evolve(bool(msg["value"]))
+            elif cmd == "dcw":
+                self.rc.set_dcw(bool(msg["value"]))
+            elif cmd == "seek":
+                self.rc.seek(float(msg["value"]))   # value = fractional position 0..1
             elif cmd == "reconfigure":
                 if self.rc and self.playing:
                     self.rc.reconfigure(steps=msg.get("steps"), window_s=msg.get("window"))

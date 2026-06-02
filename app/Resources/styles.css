@@ -8,8 +8,8 @@
   --bg:         oklch(0.175 0.005 60);
   --bg-2:       oklch(0.21  0.005 60);   /* dropdown menu surface */
   --fg:         oklch(0.96  0.005 60);
-  --muted:      oklch(0.56  0.006 60);
-  --faint:      oklch(0.36  0.006 60);
+  --muted:      oklch(0.64  0.006 60);
+  --faint:      oklch(0.48  0.006 60);
   --hair:       oklch(0.30  0.006 60 / 0.55);
   --accent:     oklch(0.84  0.05  60);
   --accent-dim: oklch(0.84  0.05  60 / 0.5);
@@ -106,6 +106,25 @@ body {
 .formats {
   font-size: 10.5px; color: var(--faint);
   letter-spacing: 0.02em;
+}
+
+.source-loading {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  width: 100%; padding: 8px 0;
+}
+.loadbar {
+  position: relative; overflow: hidden;
+  width: 70%; max-width: 360px; height: 6px; border-radius: 5px;
+  background: oklch(1 0 0 / 0.06);
+}
+.loadbar-fill {
+  position: absolute; top: 0; bottom: 0; width: 38%; border-radius: 5px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: indeterminate 1.15s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+@keyframes indeterminate { 0% { left: -40%; } 100% { left: 100%; } }
+.loadstage {
+  font-size: 11px; color: var(--muted); letter-spacing: 0.01em;
 }
 
 .source-loaded {

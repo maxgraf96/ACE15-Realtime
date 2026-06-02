@@ -42,6 +42,8 @@ public:
     void setCharacter(double v);
     void setMetas(bool sendBpm, bool sendKey);   // inject detected tempo/key into the prompt?
     void setEvolve(bool on);
+    void setDcw(bool on);   // wavelet-domain per-step correction (DCW) on/off
+    void seek(double fraction);   // jump playback to a fractional position (0..1)
     void reconfigure(int steps, double window);
     void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track
     void play();
@@ -61,6 +63,7 @@ private:
     bool sidecarSpawned = false;
     juce::String selectedModel { "quality" };  // default XL; "fast"(2B) / "quality"(XL)
     bool sendBpm { true }, sendKey { true };   // inject detected tempo/key into prompt Metas
+    bool dcwEnabled { false };              // DCW correction; off by default (runs hot in our regime)
     juce::var lastLoad;                      // last load message, for model-change reload
 
     double hostSampleRate = 48000.0;

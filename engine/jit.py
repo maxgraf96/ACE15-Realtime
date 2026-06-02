@@ -80,6 +80,14 @@ class JITCover:
         self.evolve = False; self._regen = 0
         self.tags = ""
         self.send_bpm = True; self.send_key = True   # inject detected tempo/key into Metas
+        # DCW (Differential Correction in Wavelet domain) — sampler-side per-step
+        # correction (acestep.engine.dcw). OFF by default: in our turbo/few-step
+        # regime it runs the output hot (pushes peaks into the soft-clip limiter →
+        # harsh on dense material) for only a marginal structure gain. Opt-in via the
+        # UI toggle. Recommended ACE-Step values kept (double/0.05/0.02/haar).
+        self.dcw_enabled = False
+        self.dcw_mode = "double"; self.dcw_scaler = 0.05
+        self.dcw_high_scaler = 0.02; self.dcw_wavelet = "haar"
         # Lyrics: EMPTY measured stronger style than "[Instrumental]" for the cover task
         # (funk CLAP 0.22 vs 0.14) — the source structure already implies instrumental.
         self.lyrics = ""
@@ -199,8 +207,32 @@ class JITCover:
         self._encode()
         if self.handle is None:
             self.handle = self.session.stream(source=self.source, conditioning=self.cond,
-                                              steps=self.steps, shift=self.shift, pipeline_depth=1, dcw_enabled=False)
+                                              steps=self.steps, shift=self.shift, pipeline_depth=1,
+                                              **self._dcw_kwargs())
         return self
+
+    def _dcw_kwargs(self):
+        """DCW params for session.stream() / handle.base_kwargs (read every tick)."""
+        return {"dcw_enabled": self.dcw_enabled, "dcw_mode": self.dcw_mode,
+                "dcw_scaler": self.dcw_scaler, "dcw_high_scaler": self.dcw_high_scaler,
+                "dcw_wavelet": self.dcw_wavelet}
+
+    def set_dcw(self, enabled=None, mode=None, scaler=None, high_scaler=None, wavelet=None):
+        """Toggle/tune DCW. StreamDenoise.execute re-reads dcw_* from base_kwargs
+        every tick and calls pipe.set_dcw(), so mutating base_kwargs hot-applies on
+        the next regen — no pipeline rebuild. Guards against a missing wavelet dep."""
+        if enabled:
+            from . import mps_compat
+            if not mps_compat.dcw_available():
+                print("[jit] DCW requested but pytorch_wavelets is missing; staying off")
+                enabled = False
+        if enabled is not None: self.dcw_enabled = bool(enabled)
+        if mode is not None: self.dcw_mode = mode
+        if scaler is not None: self.dcw_scaler = float(scaler)
+        if high_scaler is not None: self.dcw_high_scaler = float(high_scaler)
+        if wavelet is not None: self.dcw_wavelet = wavelet
+        if self.handle is not None:
+            self.handle.base_kwargs.update(self._dcw_kwargs())
 
     def _set_prompt(self, tags):
         self.tags = tags

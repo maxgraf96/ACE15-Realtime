@@ -39,6 +39,11 @@
           <div class="drophint"><b>Drop</b> a track, or <b>browse&hairsp;…</b></div>
           <div class="formats">WAV · AIFF · FLAC · MP3</div>
         </div>
+        <div class="source-loading" id="source-loading" hidden>
+          <div class="srcname"><b id="loadname-text"></b></div>
+          <div class="loadbar"><div class="loadbar-fill"></div></div>
+          <div class="loadstage" id="loadstage-text">loading…</div>
+        </div>
         <div class="source-loaded" id="source-loaded" hidden>
           <div class="srcname">
             <b id="srcname-text"></b>
@@ -69,8 +74,8 @@
 
         <div class="row">
           <span class="lbl">Amount</span>
-          <input type="range" id="denoise" min="0.40" max="0.95" step="0.01" value="0.70"
-                 title="Structure ↔ style. Low keeps the source's groove/harmony; high follows the prompt. Real songs usually want 0.5–0.65." />
+          <input type="range" id="denoise" min="0.00" max="0.95" step="0.01" value="0.70"
+                 title="Structure ↔ style. 0 = original source (no restyle) for A/B; low keeps the groove/harmony; high follows the prompt. Real songs usually want 0.5–0.65." />
           <span class="val" id="denoise-value">0.70</span>
         </div>
 
@@ -109,6 +114,13 @@
           <span class="lbl">Mode</span>
           <button type="button" class="mode-toggle" id="evolve-toggle"
                   title="Coherent = fixed seed (one stable remix). Evolve = new variations as it loops.">Coherent</button>
+          <div style="flex:1"></div>
+        </div>
+
+        <div class="row toggle-row">
+          <span class="lbl">Correction</span>
+          <button type="button" class="mode-toggle" id="dcw-toggle"
+                  title="DCW (Differential Correction in Wavelet domain): a per-step sampler correction. Off by default — it runs the output hot (limiter saturation on dense material) in this turbo regime; toggle on to experiment.">DCW Off</button>
           <div style="flex:1"></div>
         </div>
 

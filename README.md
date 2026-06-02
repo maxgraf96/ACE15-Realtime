@@ -70,7 +70,8 @@ uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python torch torchaudio torchvision \
   "transformers>=4.51,<4.58" diffusers accelerate safetensors huggingface_hub \
   einops scipy soundfile numpy loguru toml vector-quantize-pytorch torchao \
-  soxr laion-clap            # soxr: key detection · laion-clap: dev style metric (optional)
+  soxr laion-clap \          # soxr: key detection · laion-clap: dev style metric (optional)
+  pytorch_wavelets PyWavelets  # DCW wavelet-domain correction (optional; toggle is off without it)
 
 # 2. Build the app (JUCE 8 fetched at configure; first build ~minutes)
 cmake -S app -B app/build -DCMAKE_BUILD_TYPE=Release && cmake --build app/build -j8
@@ -91,19 +92,22 @@ MelBandRoFormer are intentionally **not** downloaded.)
 
 ## Using the app
 
-Drop a track (or browse) → set a **Style** → **Play**. Edit Style live and it restyles
-in ~1–2 s. Detected **BPM · Key** show next to the filename; a live meter shows
-buffer / regens / worst-regen.
+Drop a track (or browse) → set a **Style** → **Play**. While a track loads (and on a
+model switch) the source panel shows an animated bar with the stage (loading model →
+analyzing → preparing) until it's ready. Edit Style live and it restyles in ~1–2 s. Detected **BPM · Key** show next to the filename; a live meter shows
+buffer / regens / worst-regen. **Click or drag the waveform to scrub** — playback
+jumps to that position (the playhead follows; audio re-arrives within ~lookahead).
 
 | Control | Effect |
 |---|---|
 | **Style** | Prompt (live). Style/instruments/timbre/era — comma-separated keywords. |
-| **Amount** | Structure ↔ style (denoise). Real songs usually want **~0.5–0.65**; tight loops tolerate higher. |
+| **Amount** | Structure ↔ style (denoise). **0 = the original source** (no restyle — handy for A/B); real songs usually want **~0.5–0.65**; tight loops tolerate higher. |
 | **Character** | 0 = full restyle · 1 = keep the source's own instrument/voice character. |
 | **Steps** | Diffusion steps (4–12). Fewer = snappier control; more = cleaner. Restarts on change. |
-| **Window** | Generation window seconds (bigger = more coherent). Restarts on change. |
+| **Window** | Generation window seconds (bigger = more coherent, but a longer regen → more control latency, since the buffer auto-grows to stay glitch-free). Restarts on change. |
 | **Match: Tempo / Key** | Inject the detected bpm/key into the prompt Metas. Turn Tempo off if BPM detection looks wrong. |
 | **Mode** | Coherent (fixed seed) ↔ Evolve (new variations as it loops). |
+| **Correction (DCW)** | Per-step wavelet-domain sampler correction ([`DCW`](https://arxiv.org/abs/2604.16044)). **Off by default** — in this turbo/few-step regime it runs the output hot (limiter saturation, harsh on dense material) for a marginal structure gain. Opt-in to experiment. ~1.3 ms/step on MPS, hot-applies on the next regen. |
 | **Model** | **Quality (XL)** = richer style, ~2 s control latency (default) · **Fast (2B)** = ~1 s. |
 
 ### Models
