@@ -350,6 +350,30 @@ input[type="range"]::-webkit-slider-thumb {
 .stop svg { width: 15px; height: 15px; }
 .stop:hover:not(:disabled) { color: var(--fg); border-color: var(--fg); }
 
+/* VST-style gain knobs (click-drag vertical; double-click resets; wheel = fine). */
+.knobs { display: flex; justify-content: center; gap: 52px; padding: 6px 0 2px; }
+.knob {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  cursor: ns-resize; user-select: none; touch-action: none;
+}
+.knob-dial {
+  position: relative; width: 46px; height: 46px; border-radius: 50%;
+  border: 1px solid var(--hair); background: oklch(1 0 0 / 0.02);
+  transition: border-color .15s;
+}
+.knob:hover .knob-dial { border-color: var(--muted); }
+.knob.dragging .knob-dial { border-color: var(--accent); }
+.knob-ind {
+  position: absolute; left: 50%; bottom: 50%;   /* pivot (bottom-center) sits at the dial centre */
+  width: 2px; height: 15px; margin-left: -1px;
+  background: var(--accent); border-radius: 1px;
+  transform-origin: 50% 100%;
+}
+/* Fixed width + tabular digits so the readout (e.g. "0.0 dB" -> "-20.0 dB") never
+   resizes the knob and nudges its neighbour. */
+.knob-val { font-size: 11px; color: var(--fg); font-variant-numeric: tabular-nums; min-width: 58px; text-align: center; }
+.knob-lbl { font-size: 10px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+
 /* ── Results ──────────────────────────────────────────────────────── */
 .results {
   margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--hair);
@@ -622,7 +646,8 @@ input[type="range"]::-webkit-slider-thumb {
 /* Give the source a presence on the left — it's the subject being morphed. */
 .col-left .source { min-height: 120px; }
 .col-left .srcwave { margin-top: 10px; }
-.col-left .meter { margin-top: auto; border-top: 1px solid var(--hair); }
+.col-left .knobs { margin-top: auto; }       /* push the knobs down into the lower-left area */
+.col-left .meter { border-top: 1px solid var(--hair); }
 /* Vertical hairline between the columns. */
 .col-right {
   border-left: 1px solid var(--hair);

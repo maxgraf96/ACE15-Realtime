@@ -101,6 +101,10 @@ class RealtimeCover:
         with self._lock:
             self._ctrl.append(("dcw", bool(enabled)))
 
+    def set_input_gain(self, db):
+        with self._lock:
+            self._ctrl.append(("input_gain", float(db)))
+
     def seek(self, fraction):
         """Jump playback to a fractional position (0..1) of the track. Queued so the
         producer thread (which owns the playback cursor) performs the jump: it moves
@@ -235,6 +239,7 @@ class RealtimeCover:
                 elif kind == "character": jit.set_character(val); restyled = True
                 elif kind == "metas":     jit.set_metas(send_bpm=val[0], send_key=val[1], bpm=val[2], key=val[3]); restyled = True
                 elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
+                elif kind == "input_gain": jit.set_input_gain(val); restyled = True   # re-encode source (heavy)
                 elif kind == "seek":
                     committed = None; base_f = gen_f = dec_f = int(val); tiles = {}
                     with self._lock:      # flush stale buffered audio; re-prime from the seek point

@@ -93,6 +93,7 @@ class JITCover:
         self.lyrics = ""
         self.peaks: list = []
         self.source_wav = None                 # [C, samples] @ SR — kept for the instant A/B bypass
+        self.input_gain_db = 0.0               # input trim feeding the model (<=0 dB); re-encodes the source
         self.bpm = 120; self.key = "C major"   # auto-detected in load_track
 
     def load_track(self, path, seconds=None, detect=True):
@@ -112,19 +113,33 @@ class JITCover:
         # The semantic tokenizer patchifies T into groups of SEM_PATCH (5), so the
         # source latent length MUST be a multiple of 5 or extract_hints rearrange
         # fails. Encode, truncate to a multiple, then extract hints.
-        from acestep.nodes.types import Latent
+        self.source_wav = a.waveform.detach().float().cpu()   # raw source @ SR (A/B ref + re-encode src)
+        self._encode_source()
+        self.peaks = self._compute_peaks(a.waveform, 220)
+        return self
+
+    def _encode_source(self):
+        """Encode the source waveform (scaled by the input-gain trim) into the latent
+        + hints used as the generation source. Re-callable so the input gain can change
+        live (re-encode). source_wav stays the TRUE original (the A/B bypass reference)."""
+        from acestep.nodes.types import Latent, Audio
         from acestep.engine.session import PreparedSource
-        lat = self.session.encode_audio(a)
+        g = 10.0 ** (self.input_gain_db / 20.0)
+        wav = self.source_wav if g == 1.0 else self.source_wav * g
+        lat = self.session.encode_audio(Audio(waveform=wav, sample_rate=SR))
         T = lat.tensor.shape[1]
         T5 = max(SEM_PATCH, (T // SEM_PATCH) * SEM_PATCH)
         if T5 != T:
             lat = Latent(tensor=lat.tensor[:, :T5, :].contiguous())
-            print(f"[jit] latent T {T} -> {T5} (multiple of {SEM_PATCH})")
         ctx = self.session.extract_hints(lat)
         self.source = PreparedSource(latent=lat, context_latent=ctx)
-        self.peaks = self._compute_peaks(a.waveform, 220)
-        self.source_wav = a.waveform.detach().float().cpu()   # raw source @ SR, for instant A/B
-        return self
+
+    def set_input_gain(self, db):
+        """Input trim feeding the model (max 0 dB): re-encode the source from the
+        gain-scaled waveform. Heavy (full re-encode) — run from the producer thread;
+        the ring buffer covers the stall, like one large regen."""
+        self.input_gain_db = float(db)
+        self._encode_source()
 
     def source_slice(self, f0, n_samples):
         """Original source audio for the slice starting at latent frame f0, exactly

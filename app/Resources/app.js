@@ -30,6 +30,8 @@ const play        = nf("play");
 const pauseFn     = nf("pause");
 const stop        = nf("stop");
 const setBypassFn = nf("setBypass");
+const setInputGainFn = nf("setInputGain");
+const setMakeupFn = nf("setMakeup");
 const openFile    = nf("openFile");
 
 // ── DOM ──────────────────────────────────────────────────────────────
@@ -255,6 +257,46 @@ abEl.addEventListener("click", () => {
   abEl.title = `A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: ${bypass ? "Original" : "Cover"}.`;
   setBypassFn(bypass);
 });
+
+// VST-style gain knob: vertical click-drag (up = louder), double-click resets,
+// wheel = fine step. `live` commits on every move (cheap controls); otherwise it
+// commits only on release (the input-gain re-encode is heavy).
+function makeKnob(id, min, max, def, fmt, onCommit, live) {
+  const el = $(id);
+  const ind = el.querySelector(".knob-ind");
+  const valEl = el.querySelector(".knob-val");
+  let val = def;
+  const render = () => {
+    const t = (val - min) / (max - min);
+    ind.style.transform = `rotate(${(-135 + t * 270).toFixed(1)}deg)`;
+    valEl.textContent = fmt(val);
+  };
+  const setVal = (v, commit) => {
+    val = Math.max(min, Math.min(max, v)); render();
+    if (commit) onCommit(val);
+  };
+  let dragging = false, startY = 0, startVal = 0;
+  const sens = (max - min) / 160;   // px of vertical drag for the full range
+  el.addEventListener("pointerdown", (e) => {
+    dragging = true; startY = e.clientY; startVal = val;
+    el.setPointerCapture(e.pointerId); el.classList.add("dragging"); e.preventDefault();
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (dragging) setVal(startVal + (startY - e.clientY) * sens, live);
+  });
+  const up = () => { if (dragging) { dragging = false; el.classList.remove("dragging"); onCommit(val); } };
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", up);
+  el.addEventListener("dblclick", () => setVal(def, true));
+  el.addEventListener("wheel", (e) => { e.preventDefault(); setVal(val + (e.deltaY < 0 ? 1 : -1) * (max - min) / 40, true); }, { passive: false });
+  render();
+  return { get: () => val, set: (v) => setVal(v, false) };
+}
+const dbFmt = (v) => `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
+// Input trim feeding the model (max 0 dB) — heavy re-encode, so commit on release only.
+const inGain = makeKnob("ingain-knob", -20, 0, 0, dbFmt, (v) => setInputGainFn(v), false);
+// Make-up gain just before audio-out (-20..+20 dB) — cheap, commit live while dragging.
+const makeup = makeKnob("makeup-knob", -20, 20, 0, dbFmt, (v) => setMakeupFn(v), true);
 $("reset").addEventListener("click", () => {
   denoiseEl.value = 0.7; denoiseVal.textContent = "0.70";
   charEl.value = 0; charVal.textContent = "0.00";
@@ -300,6 +342,7 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
         bpmField.value = ev.bpm; keyField.value = ev.key;   // editable; override corrects a wrong detection
         metaEdit.hidden = false;
         hideLoading(); sourceEmpty.hidden = true; sourceLoaded.hidden = false; meterEl.hidden = false;
+        if (inGain.get() !== 0) setInputGainFn(inGain.get());   // re-apply a non-default input trim (engine source is fresh)
       }
       if (playState === "playing") { play(); setTransport("playing"); setStatus("playing", "accent"); }   // resume after a (re)load (new engine starts stopped)
       else { setTransport("stopped"); setStatus("ready — press Play"); }

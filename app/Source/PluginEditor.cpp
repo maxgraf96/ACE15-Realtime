@@ -77,6 +77,14 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.setModel(args[0].toString()); completion({});
           })
+          .withNativeFunction("setInputGain", [this](auto args, auto completion)
+          {
+              processor.setInputGain((double) args[0]); completion({});
+          })
+          .withNativeFunction("setMakeup", [this](auto args, auto completion)
+          {
+              processor.setMakeup((double) args[0]); completion({});
+          })
           .withNativeFunction("setMetas", [this](auto args, auto completion)
           {
               processor.setMetas((bool) args[0], (bool) args[1],

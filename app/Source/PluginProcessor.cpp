@@ -70,7 +70,13 @@ void ACE15Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     hostSampleRate = sampleRate;
     const double ratio = (double) IpcClient::kStreamSampleRate / sampleRate;
-    resampleIn.setSize(2, (int) std::ceil(samplesPerBlock * ratio) + 8);
+    rsIn.setSize(2, (int) std::ceil(samplesPerBlock * ratio) + 16);
+    rsLeftover = 0;
+    resampler[0].reset();
+    resampler[1].reset();
+    if (std::abs(ratio - 1.0) >= 1e-6)
+        juce::Logger::writeToLog("[ACE15] output device SR=" + juce::String(sampleRate)
+            + " -> resampling 48000 (ratio " + juce::String(ratio, 4) + "); 48k avoids it entirely");
 }
 
 void ACE15Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -79,6 +85,7 @@ void ACE15Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBu
     const int numOut = buffer.getNumSamples();
     const int numCh = juce::jmin(2, buffer.getNumChannels());
     const double ratio = (double) IpcClient::kStreamSampleRate / hostSampleRate;
+    const float mk = makeupLin.load();   // make-up gain (linear), applied just before soft-clip out
 
     if (std::abs(ratio - 1.0) < 1e-6)
     {
@@ -87,28 +94,33 @@ void ACE15Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBu
         for (int ch = 0; ch < numCh; ++ch)
         {
             float* d = buffer.getWritePointer(ch);
-            for (int i = 0; i < numOut; ++i) d[i] = softClip(d[i]);
+            for (int i = 0; i < numOut; ++i) d[i] = softClip(d[i] * mk);
         }
         return;
     }
 
-    // Pull numIn @48k, linear-resample to numOut @ host SR (v1; Lagrange later).
-    const int numIn = juce::jmin(resampleIn.getNumSamples(), (int) std::lround(numOut * ratio));
-    float* ins[2] = { resampleIn.getWritePointer(0), resampleIn.getWritePointer(1) };
-    ipc.popAudio(ins, 2, numIn);
+    // 48k -> host SR via a persistent windowed-sinc interpolator (clean stopband,
+    // continuous phase + history across blocks). rsIn holds [leftover | fresh]; the
+    // interpolator consumes from the front and we carry the unconsumed tail forward.
+    const int cap = rsIn.getNumSamples();
+    const int needIn = juce::jmin(cap, (int) std::ceil(numOut * ratio) + 2);
+    const int popN = juce::jmax(0, needIn - rsLeftover);
+    float* ins[2] = { rsIn.getWritePointer(0) + rsLeftover, rsIn.getWritePointer(1) + rsLeftover };
+    ipc.popAudio(ins, 2, popN);                       // zero-fills on underrun
+    const int avail = rsLeftover + popN;
+    int used = avail;
     for (int ch = 0; ch < numCh; ++ch)
     {
-        const float* in = resampleIn.getReadPointer(juce::jmin(ch, 1));
-        float* out = buffer.getWritePointer(ch);
-        for (int i = 0; i < numOut; ++i)
-        {
-            const double pos = i * ratio;
-            const int i0 = (int) pos;
-            const int i1 = juce::jmin(i0 + 1, numIn - 1);
-            const float f = (float) (pos - i0);
-            out[i] = softClip(in[juce::jlimit(0, numIn - 1, i0)] * (1.0f - f) + in[i1] * f);
-        }
+        used = resampler[ch].process(ratio, rsIn.getReadPointer(juce::jmin(ch, 1)),
+                                     buffer.getWritePointer(ch), numOut);
+        float* d = buffer.getWritePointer(ch);
+        for (int i = 0; i < numOut; ++i) d[i] = softClip(d[i] * mk);
     }
+    rsLeftover = juce::jmax(0, avail - used);          // carry un-consumed input to next block
+    if (rsLeftover > 0)
+        for (int ch = 0; ch < 2; ++ch)
+            juce::FloatVectorOperations::copy(rsIn.getWritePointer(ch),
+                                              rsIn.getReadPointer(ch) + used, rsLeftover);
 }
 
 // ---- control API ----
@@ -148,6 +160,18 @@ void ACE15Processor::setModel(const juce::String& mdl)
     selectedModel = mdl;
     if (lastLoad.isObject())   // reload the current track with the new model
         sendLoad(lastLoad);
+}
+
+void ACE15Processor::setInputGain(double db)
+{
+    auto m = makeMsg("input_gain");
+    m.getDynamicObject()->setProperty("value", db);
+    ipc.sendControl(m);   // engine re-encodes the source (queued in the producer thread)
+}
+
+void ACE15Processor::setMakeup(double db)   // -20..+20 dB, applied in processBlock before soft-clip
+{
+    makeupLin.store((float) std::pow(10.0, db / 20.0));
 }
 
 void ACE15Processor::setStyle(const juce::String& tags, double denoise, double character)

@@ -15,6 +15,7 @@ CONTROL commands (JSON):
   {"cmd":"style","tags":"...","denoise":0.8,"timbre":"none"}
   {"cmd":"prompt","tags":"..."}     {"cmd":"denoise","value":0.7}
   {"cmd":"dcw","value":true}        # wavelet-domain correction on/off (live)
+  {"cmd":"input_gain","value":-6}   # source trim into the model (<=0 dB; re-encodes the source)
   {"cmd":"seek","value":0.5}        # jump to a fractional position (0..1)
   {"cmd":"enhance","tags":"..."}    # rewrite a short style into a rich caption (5Hz LM) -> "enhanced" event
   {"cmd":"play"}  {"cmd":"pause"}   {"cmd":"stop"}   # play/resume · pause (keep pos) · stop (reset to 0)
@@ -266,6 +267,8 @@ class Connection:
                 self.rc.set_evolve(bool(msg["value"]))
             elif cmd == "dcw":
                 self.rc.set_dcw(bool(msg["value"]))
+            elif cmd == "input_gain":
+                self.rc.set_input_gain(float(msg["value"]))   # source trim into the model (re-encode)
             elif cmd == "seek":
                 self.rc.seek(float(msg["value"]))   # value = fractional position 0..1
             elif cmd == "reconfigure":

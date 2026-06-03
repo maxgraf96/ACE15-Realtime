@@ -7,6 +7,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <atomic>
 #include "IpcClient.h"
 
 class ACE15Processor : public juce::AudioProcessor
@@ -47,6 +48,8 @@ public:
     void seek(double fraction);   // jump playback to a fractional position (0..1)
     void reconfigure(int steps, double window);
     void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track
+    void setInputGain(double db);   // trim feeding the model (<=0 dB); re-encodes the source
+    void setMakeup(double db);      // make-up gain right before audio-out (-20..+20 dB)
     void play();    // play / resume (keeps position)
     void pause();   // pause — keep position
     void stop();    // full stop — reset to the start
@@ -71,8 +74,15 @@ private:
     juce::var lastLoad;                      // last load message, for model-change reload
 
     double hostSampleRate = 48000.0;
-    juce::AudioBuffer<float> resampleIn; // staging at 48k
+    // 48k -> host-SR resampling (only when the device isn't 48k). A persistent
+    // windowed-sinc interpolator per channel + a leftover buffer of un-consumed
+    // 48k input, so phase + history stay continuous across blocks (linear interp
+    // with a per-block phase reset aliased badly -> "metallic" on non-48k devices).
+    juce::WindowedSincInterpolator resampler[2];
+    juce::AudioBuffer<float> rsIn;       // staged 48k input: [leftover | freshly popped]
+    int rsLeftover = 0;                  // un-consumed input samples held at the front of rsIn
     bool playing = false;
+    std::atomic<float> makeupLin { 1.0f };  // make-up gain (linear), applied just before output
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ACE15Processor)
 };

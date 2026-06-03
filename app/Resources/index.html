@@ -75,6 +75,21 @@
         </button>
       </div>
 
+      <div class="knobs">
+        <div class="knob" id="ingain-knob"
+             title="Input gain — level of the source fed into the model. Max 0 dB. Drag up/down; double-click to reset. Re-encodes on release.">
+          <div class="knob-dial"><span class="knob-ind"></span></div>
+          <div class="knob-val" id="ingain-val">0.0 dB</div>
+          <div class="knob-lbl">Input</div>
+        </div>
+        <div class="knob" id="makeup-knob"
+             title="Make-up gain — output level just before audio out (−20 to +20 dB). Drag up/down; double-click to reset.">
+          <div class="knob-dial"><span class="knob-ind"></span></div>
+          <div class="knob-val" id="makeup-val">0.0 dB</div>
+          <div class="knob-lbl">Make-up</div>
+        </div>
+      </div>
+
       <section class="meter" id="meter" hidden>
         <div class="meter-row">
           <span class="meter-lbl">buffer</span><span class="meter-val" id="m-buf">–</span>
