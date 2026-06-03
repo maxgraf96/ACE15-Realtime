@@ -65,8 +65,11 @@ void IpcClient::netLoop()
 
         if (type == 0x02) // AUDIO: float32 interleaved 4ch (cover pair + original pair)
         {
-            const int frames = (int) (len / (sizeof(float) * kStreamChannels));
-            pushAudioInterleaved(reinterpret_cast<const float*>(payload.get()), frames, kStreamChannels);
+            if (streamActive.load()) // dropped while stopped, so post-stop in-flight audio can't leak into the next play
+            {
+                const int frames = (int) (len / (sizeof(float) * kStreamChannels));
+                pushAudioInterleaved(reinterpret_cast<const float*>(payload.get()), frames, kStreamChannels);
+            }
         }
         else if (type == 0x03) // EVENT: JSON
         {
@@ -101,6 +104,9 @@ void IpcClient::pushAudioInterleaved(const float* inter, int frames, int channel
 
 int IpcClient::popAudio(float* const* out, int numCh, int n)
 {
+    if (flushPending.exchange(false))            // stop: drop everything buffered (this thread owns the read cursor)
+        fifo.finishedRead(fifo.getNumReady());
+
     int start1, size1, start2, size2;
     fifo.prepareToRead(n, start1, size1, start2, size2);
     const int got = size1 + size2;

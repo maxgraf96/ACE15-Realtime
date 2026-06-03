@@ -1,185 +1,205 @@
 <!doctype html>
 <html lang="en">
+
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ACE15 · Realtime</title>
-  <link rel="stylesheet" href="styles.css" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ACE15 · Realtime</title>
+    <link rel="stylesheet" href="styles.css" />
 </head>
+
 <body>
-  <div class="hl">
-    <header class="top">
-      <div class="brand">
-        <h1>ACE15</h1>
-        <span class="tag">Realtime cover</span>
-      </div>
-      <div class="top-right">
-        <button type="button" class="ab-toggle" id="ab-toggle" disabled
-                title="A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: Cover.">Cover</button>
-        <div class="status" id="status">
-          <span class="dot"></span>
-          <span id="status-text">starting engine…</span>
+    <div class="hl">
+        <header class="top">
+            <div class="brand">
+                <h1>ACE15</h1>
+                <span class="tag">Realtime cover</span>
+            </div>
+            <div class="top-right">
+                <button type="button" class="ab-toggle" id="ab-toggle" disabled
+                    title="A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: Cover.">Cover</button>
+                <div class="status" id="status">
+                    <span class="dot"></span>
+                    <span id="status-text">starting engine…</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="error-banner" id="error-banner" hidden>
+            <span class="error-text" id="error-text"></span>
+            <button type="button" class="error-dismiss" id="error-dismiss" aria-label="Dismiss">×</button>
         </div>
-      </div>
-    </header>
 
-    <div class="error-banner" id="error-banner" hidden>
-      <span class="error-text" id="error-text"></span>
-      <button type="button" class="error-dismiss" id="error-dismiss" aria-label="Dismiss">×</button>
-    </div>
-
-    <div class="dl" id="dl" hidden>
-      <div class="dl-label" id="dl-label">Downloading models (first run)…</div>
-      <div class="dlbar"><div class="dlbar-fill" id="dl-fill"></div></div>
-    </div>
-
-    <input type="file" id="file-picker" hidden
-           accept="audio/wav,audio/aiff,audio/flac,audio/mpeg,.wav,.aiff,.aif,.flac,.mp3,.ogg" />
-
-    <div class="body">
-    <div class="col col-left">
-      <section class="source empty" id="source">
-        <div class="source-empty" id="source-empty">
-          <div class="drophint"><b>Drop</b> a track, or <b>browse&hairsp;…</b></div>
-          <div class="formats">WAV · AIFF · FLAC · MP3</div>
+        <div class="dl" id="dl" hidden>
+            <div class="dl-label" id="dl-label">Downloading models (first run)…</div>
+            <div class="dlbar">
+                <div class="dlbar-fill" id="dl-fill"></div>
+            </div>
         </div>
-        <div class="source-loading" id="source-loading" hidden>
-          <div class="srcname"><b id="loadname-text"></b></div>
-          <div class="loadbar"><div class="loadbar-fill"></div></div>
-          <div class="loadstage" id="loadstage-text">loading…</div>
+
+        <input type="file" id="file-picker" hidden
+            accept="audio/wav,audio/aiff,audio/flac,audio/mpeg,.wav,.aiff,.aif,.flac,.mp3,.ogg" />
+
+        <div class="body">
+            <div class="col col-left">
+                <section class="source empty" id="source">
+                    <div class="source-empty" id="source-empty">
+                        <div class="drophint"><b>Drop</b> a track, or <b>browse&hairsp;…</b></div>
+                        <div class="formats">WAV · AIFF · FLAC · MP3</div>
+                    </div>
+                    <div class="source-loading" id="source-loading" hidden>
+                        <div class="srcname"><b id="loadname-text"></b></div>
+                        <div class="loadbar">
+                            <div class="loadbar-fill"></div>
+                        </div>
+                        <div class="loadstage" id="loadstage-text">loading…</div>
+                    </div>
+                    <div class="source-loaded" id="source-loaded" hidden>
+                        <div class="srcname">
+                            <b id="srcname-text"></b>
+                            <span id="srcdur-text" class="srcdur"></span>
+                            <span class="meta-edit" id="meta-edit" hidden>
+                                <input type="text" id="bpm-field" class="metafield" inputmode="numeric"
+                                    title="Detected tempo — edit to correct it. Feeds the cover's Metas when Match › Tempo is on." />
+                                <span class="metaunit">BPM</span>
+                                <span class="metasep">·</span>
+                                <input type="text" id="key-field" class="metafield keyfield"
+                                    title="Detected key — edit to correct it. Feeds the cover's Metas when Match › Key is on." />
+                            </span>
+                        </div>
+                        <div class="srcwave" id="srcwave"></div>
+                    </div>
+                </section>
+
+                <div class="transport">
+                    <button type="button" class="tbtn play-pause" id="play" disabled aria-label="Play / Pause"
+                        title="Play / Pause">
+                        <svg class="play-ico" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M8 5v14l11-7z" />
+                        </svg>
+                        <svg class="pause-ico" viewBox="0 0 24 24" aria-hidden="true">
+                            <rect x="7" y="5" width="3.6" height="14" rx="1" />
+                            <rect x="13.4" y="5" width="3.6" height="14" rx="1" />
+                        </svg>
+                    </button>
+                    <button type="button" class="tbtn stop" id="stop" disabled aria-label="Stop"
+                        title="Stop — reset to the start">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <rect x="6.5" y="6.5" width="11" height="11" rx="2" />
+                        </svg>
+                    </button>
+                </div>
+
+                <div class="knobs">
+                    <div class="knob" id="ingain-knob"
+                        title="Input gain — level of the source fed into the model. Max 0 dB. Drag up/down; double-click to reset. Re-encodes on release.">
+                        <div class="knob-dial"><span class="knob-ind"></span></div>
+                        <div class="knob-val" id="ingain-val">0.0 dB</div>
+                        <div class="knob-lbl">Input</div>
+                    </div>
+                    <div class="knob" id="makeup-knob"
+                        title="Make-up gain — output level just before audio out (−20 to +20 dB). Drag up/down; double-click to reset.">
+                        <div class="knob-dial"><span class="knob-ind"></span></div>
+                        <div class="knob-val" id="makeup-val">0.0 dB</div>
+                        <div class="knob-lbl">Make-up</div>
+                    </div>
+                </div>
+
+                <section class="meter" id="meter" hidden>
+                    <div class="meter-row">
+                        <span class="meter-lbl">buffer</span><span class="meter-val" id="m-buf">–</span>
+                        <span class="meter-lbl">regens</span><span class="meter-val" id="m-regens">–</span>
+                        <span class="meter-lbl">worst</span><span class="meter-val" id="m-lat">–</span>
+                    </div>
+                </section>
+            </div>
+
+            <div class="col col-right">
+                <section class="controls" id="controls">
+                    <div class="row row-style">
+                        <span class="lbl">Style</span>
+                        <textarea id="prompt" rows="1"
+                            placeholder="e.g. lo-fi hip hop, warm Rhodes">Instrumental jazz trio piece with a warm, live-in-the-room feel. The track is built upon an elegant walking upright bass line that provides rhythmic drive and melodic counterpoint, paired with tasteful piano comping and crisp drum work featuring prominent ride cymbal patterns and subtle snare ghostflams.</textarea>
+                        <button type="button" class="mode-toggle enhance-btn" id="enhance-btn"
+                            title="Expand with LM — rewrite your short style into a rich, detailed caption (5Hz LM). First use downloads ~1.2 GB.">Expand
+                            with LM</button>
+                        <button type="button" class="prompt-clear mode-toggle" id="prompt-clear" hidden
+                            title="Clear Style" aria-label="Clear style">×</button>
+                    </div>
+
+                    <div class="row">
+                        <span class="lbl">Amount</span>
+                        <input type="range" id="denoise" min="0.00" max="1.00" step="0.01" value="0.70"
+                            title="Structure ↔ style. 0 = original source (no restyle) for A/B; low keeps the groove/harmony; high follows the prompt. Real songs usually want 0.5–0.65." />
+                        <span class="val" id="denoise-value">0.70</span>
+                    </div>
+
+                    <div class="row">
+                        <span class="lbl">Character</span>
+                        <input type="range" id="character" min="0.00" max="1.00" step="0.01" value="0.00"
+                            title="0 = full restyle · 1 = keep the source's own instrument/voice character" />
+                        <span class="val" id="character-value">0.00</span>
+                    </div>
+
+                    <div class="row">
+                        <span class="lbl">Steps</span>
+                        <input type="range" id="steps" min="4" max="12" step="1" value="8"
+                            title="Diffusion steps per window. Fewer = snappier control; more = cleaner. Restarts on change." />
+                        <span class="val" id="steps-value">8</span>
+                    </div>
+
+                    <div class="row">
+                        <span class="lbl">Window</span>
+                        <input type="number" id="window" class="numfield" min="6" max="30" step="1" value="20"
+                            title="Generation window (s). Larger = more coherent. Restarts on change." />
+                        <div style="flex:1"></div>
+                        <span class="val">sec</span>
+                    </div>
+
+                    <div class="row toggle-row">
+                        <span class="lbl">Match</span>
+                        <button type="button" class="mode-toggle one-shot" id="bpm-toggle"
+                            title="Inject the detected tempo into the prompt. Off = let the model pick the tempo (useful if BPM detection looks wrong).">Tempo</button>
+                        <button type="button" class="mode-toggle one-shot" id="key-toggle"
+                            title="Inject the detected key into the prompt. Off = let the model pick the key.">Key</button>
+                        <div style="flex:1"></div>
+                    </div>
+
+                    <div class="row toggle-row">
+                        <span class="lbl">Mode</span>
+                        <button type="button" class="mode-toggle" id="evolve-toggle"
+                            title="Coherent = fixed seed (one stable remix). Evolve = new variations as it loops.">Coherent</button>
+                        <div style="flex:1"></div>
+                    </div>
+
+                    <div class="row toggle-row">
+                        <span class="lbl">Correction</span>
+                        <button type="button" class="mode-toggle" id="dcw-toggle"
+                            title="DCW (Differential Correction in Wavelet domain): a per-step sampler correction. Off by default — it runs the output hot (limiter saturation on dense material) in this turbo regime; toggle on to experiment.">DCW
+                            Off</button>
+                        <div style="flex:1"></div>
+                    </div>
+
+                    <div class="row toggle-row">
+                        <span class="lbl">Model</span>
+                        <button type="button" class="mode-toggle one-shot" id="model-toggle"
+                            title="Quality = XL (richer style transfer, ~2s latency; +20 GB on first use). Fast = 2B (low latency, ~1s).">Quality</button>
+                        <div style="flex:1"></div>
+                    </div>
+
+                </section>
+            </div>
         </div>
-        <div class="source-loaded" id="source-loaded" hidden>
-          <div class="srcname">
-            <b id="srcname-text"></b>
-            <span id="srcdur-text" class="srcdur"></span>
-            <span class="meta-edit" id="meta-edit" hidden>
-              <input type="text" id="bpm-field" class="metafield" inputmode="numeric"
-                     title="Detected tempo — edit to correct it. Feeds the cover's Metas when Match › Tempo is on." />
-              <span class="metaunit">BPM</span>
-              <span class="metasep">·</span>
-              <input type="text" id="key-field" class="metafield keyfield"
-                     title="Detected key — edit to correct it. Feeds the cover's Metas when Match › Key is on." />
+
+        <footer class="footer">
+            <span class="kbd-hint">
+                <kbd>Space</kbd> play / pause · type a <b>Style</b> and it restyles live in ~1 s · ride <b>Amount</b>
+                (source → styled)
             </span>
-          </div>
-          <div class="srcwave" id="srcwave"></div>
-        </div>
-      </section>
-
-      <div class="transport">
-        <button type="button" class="tbtn play-pause" id="play" disabled aria-label="Play / Pause" title="Play / Pause">
-          <svg class="play-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-          <svg class="pause-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5" width="3.6" height="14" rx="1"/><rect x="13.4" y="5" width="3.6" height="14" rx="1"/></svg>
-        </button>
-        <button type="button" class="tbtn stop" id="stop" disabled aria-label="Stop" title="Stop — reset to the start">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/></svg>
-        </button>
-      </div>
-
-      <div class="knobs">
-        <div class="knob" id="ingain-knob"
-             title="Input gain — level of the source fed into the model. Max 0 dB. Drag up/down; double-click to reset. Re-encodes on release.">
-          <div class="knob-dial"><span class="knob-ind"></span></div>
-          <div class="knob-val" id="ingain-val">0.0 dB</div>
-          <div class="knob-lbl">Input</div>
-        </div>
-        <div class="knob" id="makeup-knob"
-             title="Make-up gain — output level just before audio out (−20 to +20 dB). Drag up/down; double-click to reset.">
-          <div class="knob-dial"><span class="knob-ind"></span></div>
-          <div class="knob-val" id="makeup-val">0.0 dB</div>
-          <div class="knob-lbl">Make-up</div>
-        </div>
-      </div>
-
-      <section class="meter" id="meter" hidden>
-        <div class="meter-row">
-          <span class="meter-lbl">buffer</span><span class="meter-val" id="m-buf">–</span>
-          <span class="meter-lbl">regens</span><span class="meter-val" id="m-regens">–</span>
-          <span class="meter-lbl">worst</span><span class="meter-val" id="m-lat">–</span>
-        </div>
-      </section>
+            <button type="button" class="mode-toggle" id="reset" title="Reset Amount / Character / Mode">Reset</button>
+        </footer>
     </div>
-
-    <div class="col col-right">
-      <section class="controls" id="controls">
-        <div class="row row-style">
-          <span class="lbl">Style</span>
-          <textarea id="prompt" rows="1" placeholder="e.g. lo-fi hip hop, warm Rhodes">A sophisticated instrumental jazz trio piece with a warm, live-in-the-room feel. The track is built upon an elegant walking upright bass line that provides both rhythmic drive and melodic counterpoint, paired with tasteful piano comping and crisp drum work featuring prominent ride cymbal patterns and subtle snare ghostflams.</textarea>
-          <button type="button" class="mode-toggle enhance-btn" id="enhance-btn"
-                  title="Expand with LM — rewrite your short style into a rich, detailed caption (5Hz LM). First use downloads ~1.2 GB.">Expand with LM</button>
-          <button type="button" class="prompt-clear mode-toggle" id="prompt-clear" hidden
-                  title="Clear Style" aria-label="Clear style">×</button>
-        </div>
-
-        <div class="row">
-          <span class="lbl">Amount</span>
-          <input type="range" id="denoise" min="0.00" max="0.95" step="0.01" value="0.70"
-                 title="Structure ↔ style. 0 = original source (no restyle) for A/B; low keeps the groove/harmony; high follows the prompt. Real songs usually want 0.5–0.65." />
-          <span class="val" id="denoise-value">0.70</span>
-        </div>
-
-        <div class="row">
-          <span class="lbl">Character</span>
-          <input type="range" id="character" min="0.00" max="1.00" step="0.01" value="0.00"
-                 title="0 = full restyle · 1 = keep the source's own instrument/voice character" />
-          <span class="val" id="character-value">0.00</span>
-        </div>
-
-        <div class="row">
-          <span class="lbl">Steps</span>
-          <input type="range" id="steps" min="4" max="12" step="1" value="8"
-                 title="Diffusion steps per window. Fewer = snappier control; more = cleaner. Restarts on change." />
-          <span class="val" id="steps-value">8</span>
-        </div>
-
-        <div class="row">
-          <span class="lbl">Window</span>
-          <input type="number" id="window" class="numfield" min="6" max="30" step="1" value="20"
-                 title="Generation window (s). Larger = more coherent. Restarts on change." />
-          <div style="flex:1"></div>
-          <span class="val">sec</span>
-        </div>
-
-        <div class="row toggle-row">
-          <span class="lbl">Match</span>
-          <button type="button" class="mode-toggle one-shot" id="bpm-toggle"
-                  title="Inject the detected tempo into the prompt. Off = let the model pick the tempo (useful if BPM detection looks wrong).">Tempo</button>
-          <button type="button" class="mode-toggle one-shot" id="key-toggle"
-                  title="Inject the detected key into the prompt. Off = let the model pick the key.">Key</button>
-          <div style="flex:1"></div>
-        </div>
-
-        <div class="row toggle-row">
-          <span class="lbl">Mode</span>
-          <button type="button" class="mode-toggle" id="evolve-toggle"
-                  title="Coherent = fixed seed (one stable remix). Evolve = new variations as it loops.">Coherent</button>
-          <div style="flex:1"></div>
-        </div>
-
-        <div class="row toggle-row">
-          <span class="lbl">Correction</span>
-          <button type="button" class="mode-toggle" id="dcw-toggle"
-                  title="DCW (Differential Correction in Wavelet domain): a per-step sampler correction. Off by default — it runs the output hot (limiter saturation on dense material) in this turbo regime; toggle on to experiment.">DCW Off</button>
-          <div style="flex:1"></div>
-        </div>
-
-        <div class="row toggle-row">
-          <span class="lbl">Model</span>
-          <button type="button" class="mode-toggle one-shot" id="model-toggle"
-                  title="Quality = XL (richer style transfer, ~2s latency; +20 GB on first use). Fast = 2B (low latency, ~1s).">Quality</button>
-          <div style="flex:1"></div>
-        </div>
-
-      </section>
-    </div>
-    </div>
-
-    <footer class="footer">
-      <span class="kbd-hint">
-        <kbd>Space</kbd> play / pause · type a <b>Style</b> and it restyles live in ~1 s · ride <b>Amount</b> (source → styled)
-      </span>
-      <button type="button" class="mode-toggle" id="reset" title="Reset Amount / Character / Mode">Reset</button>
-    </footer>
-  </div>
-  <script src="app.js"></script>
+    <script src="app.js"></script>
 </body>
+
 </html>

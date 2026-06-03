@@ -88,9 +88,10 @@ class JITCover:
         self.dcw_enabled = False
         self.dcw_mode = "double"; self.dcw_scaler = 0.05
         self.dcw_high_scaler = 0.02; self.dcw_wavelet = "haar"
-        # Lyrics: EMPTY measured stronger style than "[Instrumental]" for the cover task
-        # (funk CLAP 0.22 vs 0.14) — the source structure already implies instrumental.
-        self.lyrics = ""
+        # Lyrics: always inject [Instrumental] (user choice) to keep covers instrumental
+        # / suppress sung-lyric artifacts. (An earlier probe found EMPTY gave marginally
+        # stronger style — funk CLAP 0.22 vs 0.14 — but instrumental-locking wins here.)
+        self.lyrics = "[Instrumental]"
         self.peaks: list = []
         self.source_wav = None                 # [C, samples] @ SR — kept for the instant A/B bypass
         self.input_gain_db = 0.0               # input trim feeding the model (<=0 dB); re-encodes the source

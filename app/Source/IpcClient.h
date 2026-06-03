@@ -46,6 +46,13 @@ public:
     // engine streams both, frame-aligned; this just picks which pair to output).
     void setBypass(bool b) { bypass.store(b); }
 
+    // Stop housekeeping: discard everything buffered (audio thread does it on the
+    // next callback) so playback silences immediately and nothing stale carries to
+    // the next play. setStreamActive(false) makes the net thread DROP any audio
+    // still in flight over the socket; re-enable on play.
+    void flushRing() { flushPending.store(true); }
+    void setStreamActive(bool a) { streamActive.store(a); }
+
     // EVENT callback (invoked on the message thread).
     std::function<void(juce::var)> onEvent;
 
@@ -59,6 +66,8 @@ private:
     std::atomic<bool> running { false };
     std::atomic<bool> connected { false };
     std::atomic<bool> bypass { false };       // A/B: output the original-source pair instead of the cover
+    std::atomic<bool> flushPending { false }; // audio thread discards the ring on the next callback
+    std::atomic<bool> streamActive { true };  // false => net thread drops incoming audio (post-stop in-flight)
 
     static constexpr int kStreamChannels = 4; // wire: [coverL,coverR, origL,origR]
     static constexpr int kRingFrames = kStreamSampleRate * 8; // 8 s jitter buffer

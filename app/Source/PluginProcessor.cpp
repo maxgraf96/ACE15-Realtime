@@ -258,9 +258,12 @@ void ACE15Processor::reconfigure(int steps, double window)
     ipc.sendControl(m);
 }
 
-void ACE15Processor::play()  { ipc.sendControl(makeMsg("play"));  playing = true;  }   // play / resume
-void ACE15Processor::pause() { ipc.sendControl(makeMsg("pause")); playing = false; }   // keep position
-void ACE15Processor::stop()  { ipc.sendControl(makeMsg("stop"));  playing = false; }   // full stop, reset to 0
+void ACE15Processor::play()  { ipc.setStreamActive(true); ipc.sendControl(makeMsg("play")); playing = true; }  // play / resume
+void ACE15Processor::pause() { ipc.sendControl(makeMsg("pause")); playing = false; }   // keep position (engine + C++ buffer)
+// Full stop: silence NOW by flushing the C++ jitter ring + dropping any audio still in
+// flight over the socket, so no pre-stop sound tails out or leaks into the next play.
+// (The sidecar separately resets the engine to position 0.)
+void ACE15Processor::stop()  { ipc.setStreamActive(false); ipc.flushRing(); ipc.sendControl(makeMsg("stop")); playing = false; }
 
 // A/B: purely local — the engine already streams both cover and original, so this
 // just flips which pair the audio callback outputs. No control frame, no latency.
