@@ -72,6 +72,9 @@ class JITCover:
         from acestep.engine.session import Session
         self.session = Session(device=device, decoder_backend="eager", vae_backend="eager",
                                use_flash_attention=False, vae_window=0.0, config_path=config_path)
+        self.device = device
+        self.stems = None      # OUTPUT stem mixer: stems to KEEP in the cover output (e.g. ['drums']); None/all = full mix
+        self._sep = None       # lazy StemSeparator
         self.steps = steps; self.shift = shift
         self.source = None; self.cond = None; self.handle = None
         self.track_dur = 0.0; self.denoise = 0.8
@@ -147,6 +150,36 @@ class JITCover:
     # ---- live / streaming source (Phase 3: real-time input) ----
     LIVE_CHUNK_F = 25     # latent frames appended per encode step (1.0 s; multiple of SEM_PATCH)
     LIVE_MARGIN_F = 12    # ~0.48 s overlap each side, discarded — measured near-lossless (rel-err 6e-4)
+    HINT_MARGIN_F = 25    # left-context margin for incremental (frozen) hint extraction (multiple of 5)
+    OUT_SEP_MARGIN_F = 20  # discard margin for OUTPUT separation (~0.8s; rolling-vs-whole corr 0.976, fits headroom)
+
+    def set_stems(self, stems):
+        """OUTPUT stem mixer: keep only these stems (e.g. ['drums']) of the generated cover.
+        None / all-4 = full mix (no separation). Applied to subsequent decoded slices."""
+        self.stems = list(stems) if stems else None
+
+    def _ensure_sep(self):
+        if self._sep is None:
+            from .separation import StemSeparator
+            self._sep = StemSeparator(device=self.device)
+        return self._sep
+
+    def decode_out(self, lat, cache, a, b):
+        """Decode cover local frames [a,b) -> audio [2,(b-a)*SPF], then (if a stem subset is
+        selected) separate the decoded cover and keep only those stems. Separates a margin
+        window (overlap-discard) so per-slice separation is seamless; reuses the tile cache."""
+        full = self._ensure_tiles(lat, cache, a, b)
+        from .separation import STEMS
+        st = self.stems
+        if not st or set(st) >= set(STEMS):          # full mix -> no separation
+            return full
+        m = self.OUT_SEP_MARGIN_F
+        Wl = lat.tensor.shape[1]
+        a2, b2 = max(0, a - m), min(Wl, b + m)
+        wide = self._ensure_tiles(lat, cache, a2, b2)   # cover audio incl. margin (cached/redecoded tiles)
+        mix = self._ensure_sep().separate(wide, st)     # one Demucs pass -> summed selected stems [2, ...]
+        lo = (a - a2) * SPF
+        return mix[:, lo: lo + (b - a) * SPF]
 
     def begin_live(self):
         """Start an EMPTY streaming source, grown by feed_live()+encode_pending(). For
@@ -157,6 +190,7 @@ class JITCover:
         self._live_lock = _th.Lock()
         self._live_raw = torch.zeros(2, 0)   # raw 48k stereo (cpu); also the A/B reference
         self._enc_f = 0                      # source-latent frames committed so far
+        self._ctx = None                     # frozen (append-only) hints for the streaming source
         self.source = None
         self.source_wav = self._live_raw
         self.peaks = []
@@ -185,6 +219,17 @@ class JITCover:
         (MPS). Returns the number of source frames now available to generate from."""
         from acestep.nodes.types import Audio, Latent
         from acestep.engine.session import PreparedSource
+        if getattr(self, "_dbg_whole", False):   # DEBUG: re-encode the WHOLE raw (seamless source)
+            with self._live_lock:
+                raw = self._live_raw
+            n = (raw.shape[1] // SPF // SEM_PATCH) * SEM_PATCH
+            if n <= self._enc_f:
+                return self._enc_f
+            lat = self.session.encode_audio(Audio(waveform=raw[:, :n * SPF], sample_rate=SR)).tensor[:, :n, :].contiguous()
+            self.source = PreparedSource(latent=Latent(tensor=lat),
+                                         context_latent=self.session.extract_hints(Latent(tensor=lat)))
+            self._enc_f = n
+            return n
         cf, mf = self.LIVE_CHUNK_F, self.LIVE_MARGIN_F
         with self._live_lock:
             raw = self._live_raw
@@ -202,8 +247,17 @@ class JITCover:
         new = new.contiguous()
         full = new if self.source is None else torch.cat([self.source.latent.tensor, new], dim=1)
         self._enc_f += cf
-        ctx = self.session.extract_hints(Latent(tensor=full))
-        self.source = PreparedSource(latent=Latent(tensor=full), context_latent=ctx)
+        # STABLE hints: extract for the NEW region only (with a left-context margin) and
+        # FREEZE — append-only. Re-extracting the whole growing latent each chunk drifts the
+        # hints of already-committed frames, so the pinned rolling continuation mismatches
+        # what `committed` was generated against -> warble. File mode's hints are stable.
+        hm = self.HINT_MARGIN_F
+        old = self._enc_f - cf
+        lo = max(0, old - hm)                          # multiple of 5 (cf, hm, enc_f all multiples of 5)
+        hint = self.session.extract_hints(Latent(tensor=full[:, lo:self._enc_f, :])).tensor
+        new_ctx = hint[:, old - lo:, :].contiguous()   # hints for [old, enc_f) = the new cf frames
+        self._ctx = new_ctx if self._ctx is None else torch.cat([self._ctx, new_ctx], dim=1)
+        self.source = PreparedSource(latent=Latent(tensor=full), context_latent=Latent(tensor=self._ctx))
         return self._enc_f
 
     def source_slice(self, f0, n_samples):

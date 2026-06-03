@@ -55,6 +55,7 @@ public:
     void startRealtime(const juce::String& tags, double denoise, double character,
                        const juce::String& bpm, const juce::String& key);
     void stopRealtime();
+    void setStems(const juce::var& stems);   // live source separation: keep only these stems (e.g. ["drums"])
     void play();    // play / resume (keeps position)
     void pause();   // pause — keep position
     void stop();    // full stop — reset to the start
@@ -75,6 +76,7 @@ private:
     juce::String selectedModel { "quality" };  // default XL; "fast"(2B) / "quality"(XL)
     bool sendBpm { true }, sendKey { true };   // inject detected tempo/key into prompt Metas
     juce::String metaBpm, metaKey;             // user-edited tempo/key (empty = use auto-detected)
+    juce::var liveStems;                        // selected live stems (array; empty = full mix)
     bool dcwEnabled { false };              // DCW correction; off by default (runs hot in our regime)
     juce::var lastLoad;                      // last load message, for model-change reload
 
@@ -86,6 +88,13 @@ private:
     juce::WindowedSincInterpolator resampler[2];
     juce::AudioBuffer<float> rsIn;       // staged 48k input: [leftover | freshly popped]
     int rsLeftover = 0;                  // un-consumed input samples held at the front of rsIn
+    // Live INPUT host-SR -> 48k, resampled CONTINUOUSLY (phase-tracked) so the engine gets a
+    // clean source (per-chunk resampling drifts/warbles). Plus a dry copy for input monitoring.
+    juce::WindowedSincInterpolator inResamp[2];
+    juce::AudioBuffer<float> inStage;    // staged host-SR input awaiting resample
+    int inStageLen = 0;
+    juce::AudioBuffer<float> in48;       // resampled 48k input to stream to the engine
+    juce::AudioBuffer<float> monBuf;     // dry input (host SR) saved for the monitor mix
     bool playing = false;
     std::atomic<float> makeupLin { 1.0f };  // make-up gain (linear), applied just before output
     std::atomic<bool> captureInput { false }; // real-time mode: stream the live input bus to the engine

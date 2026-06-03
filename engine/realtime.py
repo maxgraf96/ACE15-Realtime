@@ -56,6 +56,9 @@ class RealtimeCover:
         self.full_T = 0
         self.live = False              # real-time live-input mode (source grows from a stream)
         self.beats_per_bar = 4         # tempo grid (4/4); bar = 60/bpm * beats_per_bar
+        self.live_pin_bars = 1         # live window = (pin + hop) bars; bigger = more context, more latency
+        self.live_hop_bars = 1
+        self.live_anchor_bars = 4      # re-anchor the roll to a fresh source-cover every N bars (0 = never)
         self._bar_trail_s = 0.0        # achieved output trailing (whole bars) in live mode
         self._running = False
         self._done = False
@@ -107,6 +110,16 @@ class RealtimeCover:
     def set_input_gain(self, db):
         with self._lock:
             self._ctrl.append(("input_gain", float(db)))
+
+    def set_stems(self, stems):
+        """OUTPUT stem mixer: keep only these stems (e.g. ['drums']) of the generated cover."""
+        if self._running:
+            with self._lock:
+                self._ctrl.append(("stems", stems))
+        else:
+            self.jit.set_stems(stems)
+            if stems:
+                self.jit._ensure_sep()   # pre-load Demucs now (producer not running) — avoid a mid-stream stall
 
     def seek(self, fraction):
         """Jump playback to a fractional position (0..1) of the track. Queued so the
@@ -303,7 +316,7 @@ class RealtimeCover:
                     gen_f += new.shape[1]
                 self.regens += 1
             # 2) decode + push the next slice from the continuous committed latent
-            seg = jit._ensure_tiles(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
+            seg = jit.decode_out(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
             mps_compat.mps_sync()
             if jit.dcw_enabled: seg = seg * self._dcw_gain   # make-up for DCW's level boost
             orig = jit.source_slice(dec_f, seg.shape[-1])    # raw source, same frames -> instant A/B
@@ -329,11 +342,14 @@ class RealtimeCover:
         # round the output up to a whole bar so the cover trails the input by N bars exactly.
         bpm = float(getattr(jit, "bpm", 120) or 120); bpm = min(220.0, max(40.0, bpm))
         bar_frames = max(1, round(60.0 / bpm * self.beats_per_bar * FPS))
-        self._pin_f = self._hop_f = bar_frames        # 2-bar window (1-bar pin + 1-bar hop), bar-aligned
+        self._pin_f = bar_frames * self.live_pin_bars   # bar-aligned window = pin + hop bars
+        self._hop_f = bar_frames * self.live_hop_bars
         bar_s = bar_frames / FPS
         C = max(1, self._pin_f); H = max(1, self._hop_f)
         headroom = jit._TILE + jit._TOV
+        anchor_period = bar_frames * self.live_anchor_bars   # 0 = never re-anchor
         committed = None; base_f = 0; gen_f = 0; dec_f = 0; tiles = {}
+        anchor_f = 0
         aligned = False
         while self._running:
             avail = jit.encode_pending()            # rolling-encode new live input (MPS, this thread)
@@ -350,10 +366,17 @@ class RealtimeCover:
                 elif kind == "metas":     jit.set_metas(send_bpm=val[0], send_key=val[1], bpm=val[2], key=val[3]); restyled = True
                 elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
                 elif kind == "input_gain": jit.input_gain_db = float(val)   # live: applied on feed, no re-encode
+                elif kind == "stems":     jit.set_stems(val)   # source separation; affects future encode chunks
             if restyled and committed is not None and gen_f > dec_f and (dec_f - base_f) >= C:
                 committed = committed[:, :dec_f - base_f, :].contiguous(); gen_f = dec_f
                 tcut = (dec_f - base_f) // jit._TILE
                 tiles = {t: v for t, v in tiles.items() if t < tcut}
+            # RE-ANCHOR: the pinned roll accumulates error over many hops (drift -> warble).
+            # Periodically discard the drifted `committed` and re-prime a FRESH source-derived
+            # window at the playhead (like the file producer's loop restart) so drift can't grow.
+            if (anchor_period and committed is not None and (dec_f - anchor_f) >= anchor_period
+                    and (avail - dec_f) >= C + H):
+                committed = None; base_f = gen_f = dec_f; tiles = {}; anchor_f = dec_f
             # wait until the handle exists and the first window's worth of source is captured
             if jit.handle is None or avail < C + H:
                 time.sleep(0.02); continue
@@ -396,7 +419,7 @@ class RealtimeCover:
                     z = torch.zeros(2, n_sil); self._push(z, z)
                 aligned = True
                 self._bar_trail_s = target
-            seg = jit._ensure_tiles(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
+            seg = jit.decode_out(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
             mps_compat.mps_sync()
             if jit.dcw_enabled: seg = seg * self._dcw_gain
             orig = jit.source_slice(dec_f, seg.shape[-1])    # A/B = your live input (delayed), same frames

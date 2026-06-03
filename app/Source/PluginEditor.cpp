@@ -97,6 +97,7 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
               completion({});
           })
           .withNativeFunction("stopRealtime", [this](auto, auto completion) { processor.stopRealtime(); completion({}); })
+          .withNativeFunction("setStems", [this](auto args, auto completion) { processor.setStems(args[0]); completion({}); })
           .withNativeFunction("setMetas", [this](auto args, auto completion)
           {
               processor.setMetas((bool) args[0], (bool) args[1],

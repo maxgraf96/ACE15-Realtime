@@ -32,16 +32,27 @@ print(f"[probe] window={WIN}s pin={PIN}s", flush=True)
 rc = RealtimeCover(device="mps", steps=8, window_s=WIN, pin_s=PIN, prime_s=2.0,
                    lookahead_s=1.0, config_path=MODEL)
 rc.begin_live()
-rc.set_style(STYLE, denoise=0.8, bpm=120, key="C minor")
+if os.environ.get("ACE15_LIVE_TILE"):
+    rc.jit._TILE = int(os.environ["ACE15_LIVE_TILE"])   # debug: live decode tile size
+    print(f"[probe] _TILE={rc.jit._TILE}", flush=True)
+_stems = os.environ.get("ACE15_LIVE_STEMS", "").strip()
+if _stems:
+    rc.set_stems(_stems.split(","))   # e.g. "drums" -> follow only the drum stem
+    print(f"[probe] stems={_stems.split(',')}", flush=True)
+rc.set_style(STYLE, denoise=float(os.environ.get("ACE15_LIVE_DENOISE", "0.7")),
+             bpm=int(os.environ.get("ACE15_LIVE_BPM", "90")), key="C minor")
 rc.start()
 
 block = 2048; period = block / SR
-out = []; fed = 0; first_sound_t = None
+out = []; fed = 0; first_sound_t = None; N = src.shape[1]
 t0 = time.perf_counter(); nxt = t0; end = t0 + DUR
 primed_underruns0 = None
 while time.perf_counter() < end:
-    if fed < src.shape[1]:
-        rc.feed_input(src[:, fed:fed + block]); fed += block
+    s = fed % N                                   # LOOP the input continuously (as Ableton does)
+    chunk = src[:, s:s + block]
+    if chunk.shape[1] < block:
+        chunk = torch.cat([chunk, src[:, :block - chunk.shape[1]]], dim=1)
+    rc.feed_input(chunk); fed += block
     o = rc.read(block)                      # [block, 4] = cover pair + input pair
     cov = o[:, :2].copy(); out.append(cov)
     if first_sound_t is None and np.abs(cov).max() > 1e-4:

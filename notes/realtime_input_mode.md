@@ -87,6 +87,23 @@ gate the frontier. Extension, not rewrite.
 - **E — VST3 (later).** VST3 target; BPM/transport from `AudioPlayHead`; AI-only bus.
   Deferred: bundled-Python-per-instance-in-a-DAW is fragile.
 
+- **OUTPUT stem mixer (bonus). [DONE 2026-06-03]** Separate the GENERATED accompaniment into 4 stems
+  with per-stem **mute/solo** ("I only want the drums the model made"). `engine/separation.py`
+  `StemSeparator` = torchaudio **Hybrid Demucs** (`HDEMUCS_HIGH_MUSDB_PLUS`, drums/bass/other/vocals,
+  44.1k; resample 48k↔44.1k; per-chunk normalize; **warms the MPS graph at load** — first forward is
+  ~3.8s). Applied at the OUTPUT: `JITCover.decode_out(lat,cache,a,b)` decodes the cover slice, and if a
+  stem subset is selected, separates a margin window (`OUT_SEP_MARGIN_F=20` ≈0.8s, fits the live decode
+  headroom 24 → no extra latency; rolling-vs-whole corr 0.976) and keeps only those stems. Both
+  producers push via `decode_out`. `set_stems` = active stem set (UI computes from mute/solo: solos if
+  any, else non-muted). `RealtimeCover.set_stems` (queued live; pre-warms Demucs when set before start);
+  sidecar `stems` control + `live_start` pre-warms `jit._ensure_sep()` so mute/solo is responsive any
+  time; C++ `setStems`/`liveStems`; UI 4-group M/S mixer in the live panel. **CRITICAL:** in live the
+  producer is input-gated, so any mid-stream stall (Demucs first-forward ~3.8s) depletes the buffer →
+  underruns; FIX = pre-warm before the producer runs (`_ensure_sep` warmup + live_start pre-warm).
+  *Gates PASSED:* `bench/out_sep_test.py` (rolling-vs-whole corr 0.976 @margin20), `rt_live_test.py
+  ACE15_LIVE_STEMS=drums` (**0 underruns**), `rt_live_socket_test.py ACE15_LIVE_STEMS=drums` (full path).
+  (Earlier INPUT-separation attempt was reverted — user wanted output.) A/B "Input" = the full input.
+
 ## Risks
 - Latency floor ~1–2 bars (inherent; managed by bar-quant).
 - Rolling-encode added to the producer RT budget (encode+gen+decode) — keep RTF<1

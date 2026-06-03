@@ -34,6 +34,7 @@ const setInputGainFn = nf("setInputGain");
 const setMakeupFn = nf("setMakeup");
 const startRealtimeFn = nf("startRealtime");
 const stopRealtimeFn = nf("stopRealtime");
+const setStemsFn = nf("setStems");
 const openFile    = nf("openFile");
 
 // ── DOM ──────────────────────────────────────────────────────────────
@@ -285,6 +286,23 @@ function setSourceMode(live) {
   setStatus(live ? "live mode — press Play" : (loaded ? "ready — press Play" : "drop a track to begin"));
 }
 srcModeBtn.addEventListener("click", () => setSourceMode(!liveMode));
+
+// AI output stem mixer: separate the generated cover into 4 stems with per-stem mute/solo.
+// Active set (what's summed to the output) = soloed stems if any, else non-muted stems.
+// Sent as the stem list; engine treats all-4 as the full mix (no separation). Works before
+// Play (carried into live_start) and live (applied on the next chunk).
+const stemState = { drums: { m: false, s: false }, bass: { m: false, s: false },
+                    vocals: { m: false, s: false }, other: { m: false, s: false } };
+function stemActive() {
+  const solos = Object.keys(stemState).filter((k) => stemState[k].s);
+  return solos.length ? solos : Object.keys(stemState).filter((k) => !stemState[k].m);
+}
+Array.from(document.querySelectorAll(".stembtn")).forEach((b) => b.addEventListener("click", () => {
+  const st = b.dataset.stem, act = b.dataset.act;
+  stemState[st][act] = !stemState[st][act];
+  b.classList.toggle("on", stemState[st][act]);
+  setStemsFn(stemActive());
+}));
 
 // A/B: hear the original (file) / your live input (live) vs the cover. Instant —
 // the engine streams both pairs frame-aligned; this just flips which C++ outputs.

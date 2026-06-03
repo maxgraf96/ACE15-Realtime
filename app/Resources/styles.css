@@ -177,6 +177,19 @@ body.live-mode .source { cursor: default; }
 .inmeter { height: 6px; border-radius: 3px; background: var(--hair); overflow: hidden; margin-top: 6px; }
 .inmeter-fill { height: 100%; width: 0%; background: var(--accent); transition: width .08s linear; }
 .livehint { font-size: 11px; color: var(--faint); }
+/* AI output stem mixer (4 groups × mute/solo). */
+.stemmix { display: flex; flex-direction: column; gap: 5px; }
+.stemmix-hd { font-size: 11px; color: var(--muted); }
+.stemg { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.stemg-name { width: 56px; color: var(--fg); }
+.stembtn {
+  width: 22px; height: 20px; border-radius: 3px; padding: 0;
+  border: 1px solid var(--hair); background: transparent; color: var(--muted);
+  font: inherit; font-size: 10px; cursor: pointer; transition: background .12s, color .12s, border-color .12s;
+}
+.stembtn:hover { color: var(--fg); border-color: var(--fg); }
+.stembtn[data-act="m"].on { background: var(--error); color: var(--bg); border-color: var(--error); }
+.stembtn[data-act="s"].on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
 
 /* Playback-mode toggle (Loop ↔ One-shot) — sits next to the filename so it
    reads as a property of the source. Subtle by default; warm-taupe when

@@ -23,6 +23,8 @@ CONTROL commands (JSON):
   {"cmd":"enhance","tags":"..."}    # rewrite a short style into a rich caption (5Hz LM) -> "enhanced" event
   {"cmd":"play"}  {"cmd":"pause"}   {"cmd":"stop"}   # play/resume · pause (keep pos) · stop (reset to 0)
   {"cmd":"input_config","sr":48000} {"cmd":"input_start"} {"cmd":"input_stop"}  # real-time live input (0x04)
+  {"cmd":"live_start",...} {"cmd":"live_stop"}  # real-time accompaniment from the live input
+  {"cmd":"stems","value":["drums"]}  # live source separation — follow only these stems
 
 The audio sender paces at 1x; the client buffers into its own jitter ring and
 drains from the audio callback. Single client (the plugin).
@@ -269,6 +271,9 @@ class Connection:
                                         window_s=msg.get("window", 8.0), pin_s=msg.get("pin", 3.0),
                                         lookahead_s=msg.get("lookahead", 1.0), config_path=cfg)
                 self.rc.begin_live()
+                self.rc.jit._ensure_sep()             # pre-warm Demucs (before the producer runs) so the
+                self.rc.set_stems(msg.get("stems"))   # OUTPUT stem mixer responds instantly any time
+
                 if msg.get("dcw"):
                     self.rc.jit.set_dcw(enabled=True)
                 self.rc.set_style(msg.get("tags", ""), denoise=msg.get("denoise", 0.8),
@@ -326,6 +331,8 @@ class Connection:
                 self.rc.set_dcw(bool(msg["value"]))
             elif cmd == "input_gain":
                 self.rc.set_input_gain(float(msg["value"]))   # source trim into the model (re-encode)
+            elif cmd == "stems":
+                self.rc.set_stems(msg.get("value"))   # live source separation (e.g. ["drums"])
             elif cmd == "seek":
                 self.rc.seek(float(msg["value"]))   # value = fractional position 0..1
             elif cmd == "reconfigure":

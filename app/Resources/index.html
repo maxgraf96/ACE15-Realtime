@@ -84,7 +84,22 @@
                             </span>
                         </div>
                         <div class="inmeter"><div class="inmeter-fill" id="inmeter-fill"></div></div>
-                        <div class="livehint" id="livehint">press Play to start — the AI trails by a few bars, locked to the grid</div>
+                        <div class="stemmix" id="stemmix">
+                            <div class="stemmix-hd">AI output stems — mute / solo</div>
+                            <div class="stemg"><span class="stemg-name">Drums</span>
+                                <button type="button" class="stembtn" data-stem="drums" data-act="m" title="Mute drums">M</button>
+                                <button type="button" class="stembtn" data-stem="drums" data-act="s" title="Solo drums">S</button></div>
+                            <div class="stemg"><span class="stemg-name">Bass</span>
+                                <button type="button" class="stembtn" data-stem="bass" data-act="m" title="Mute bass">M</button>
+                                <button type="button" class="stembtn" data-stem="bass" data-act="s" title="Solo bass">S</button></div>
+                            <div class="stemg"><span class="stemg-name">Vocals</span>
+                                <button type="button" class="stembtn" data-stem="vocals" data-act="m" title="Mute vocals">M</button>
+                                <button type="button" class="stembtn" data-stem="vocals" data-act="s" title="Solo vocals">S</button></div>
+                            <div class="stemg"><span class="stemg-name">Other</span>
+                                <button type="button" class="stembtn" data-stem="other" data-act="m" title="Mute other">M</button>
+                                <button type="button" class="stembtn" data-stem="other" data-act="s" title="Solo other">S</button></div>
+                        </div>
+                        <div class="livehint" id="livehint">press Play to start — the AI trails by a few bars, locked to the grid. Mute/solo separates the AI accompaniment (e.g. Solo Drums = only the generated drums).</div>
                     </div>
                 </section>
 

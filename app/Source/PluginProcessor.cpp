@@ -76,6 +76,13 @@ void ACE15Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
     rsLeftover = 0;
     resampler[0].reset();
     resampler[1].reset();
+    // live input resample (host -> 48k) + monitor staging
+    inStage.setSize(2, samplesPerBlock + 64);
+    in48.setSize(2, samplesPerBlock * 2 + 64);
+    monBuf.setSize(2, samplesPerBlock + 16);
+    inStageLen = 0;
+    inResamp[0].reset();
+    inResamp[1].reset();
     if (std::abs(ratio - 1.0) >= 1e-6)
         juce::Logger::writeToLog("[ACE15] output device SR=" + juce::String(sampleRate)
             + " -> resampling 48000 (ratio " + juce::String(ratio, 4) + "); 48k avoids it entirely");
@@ -83,58 +90,99 @@ void ACE15Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
 
 void ACE15Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
-    const int numOut = buffer.getNumSamples();
-    // Real-time mode: capture live input (host SR) and stream it to the engine BEFORE
-    // overwriting the buffer with output. Off (and no input read) in file/cover mode.
-    if (captureInput.load())
+    const int nBlk = buffer.getNumSamples();
+    const int numCh = juce::jmin(2, buffer.getNumChannels());
+    const double ratio = (double) IpcClient::kStreamSampleRate / hostSampleRate;   // 48k per host sample
+    const float mk = makeupLin.load();
+
+    // ---- 1) live capture: save the dry input (monitor) + stream it to the engine @48k ----
+    bool monitor = false;
+    if (captureInput.load() && getTotalNumInputChannels() > 0 && buffer.getNumChannels() > 0)
     {
         const int nIn = juce::jmin(2, getTotalNumInputChannels());
-        if (nIn > 0 && buffer.getNumChannels() >= nIn)
+        for (int ch = 0; ch < numCh; ++ch)   // dry copy for monitoring (host SR)
+            juce::FloatVectorOperations::copy(monBuf.getWritePointer(ch),
+                buffer.getReadPointer(nIn > 1 ? juce::jmin(ch, nIn - 1) : 0), nBlk);
+        monitor = true;
+        if (std::abs(ratio - 1.0) < 1e-6)    // host == 48k: stream directly
         {
-            const float* ins[2] = { buffer.getReadPointer(0),
-                                    nIn > 1 ? buffer.getReadPointer(1) : buffer.getReadPointer(0) };
-            ipc.pushAudioIn(ins, nIn, numOut);
+            const float* ins[2] = { buffer.getReadPointer(0), nIn > 1 ? buffer.getReadPointer(1) : buffer.getReadPointer(0) };
+            ipc.pushAudioIn(ins, nIn, nBlk);
+        }
+        else                                 // host != 48k: continuous (phase-tracked) resample -> 48k
+        {
+            const double inSpeed = hostSampleRate / (double) IpcClient::kStreamSampleRate;   // host per 48k
+            for (int ch = 0; ch < 2; ++ch)
+                juce::FloatVectorOperations::copy(inStage.getWritePointer(ch) + inStageLen,
+                    buffer.getReadPointer(nIn > 1 ? juce::jmin(ch, nIn - 1) : 0), nBlk);
+            const int avail = inStageLen + nBlk;
+            int numOut = juce::jlimit(0, in48.getNumSamples(), (int) ((double) avail / inSpeed) - 1);
+            int usedIn = avail;
+            if (numOut > 0)
+            {
+                for (int ch = 0; ch < 2; ++ch)
+                    usedIn = inResamp[ch].process(inSpeed, inStage.getReadPointer(ch), in48.getWritePointer(ch), numOut);
+                float* outs[2] = { in48.getWritePointer(0), in48.getWritePointer(1) };
+                ipc.pushAudioIn(outs, 2, numOut);
+            }
+            inStageLen = juce::jmax(0, avail - usedIn);
+            if (inStageLen > 0)
+                for (int ch = 0; ch < 2; ++ch)
+                    juce::FloatVectorOperations::copy(inStage.getWritePointer(ch),
+                        inStage.getReadPointer(ch) + usedIn, inStageLen);
         }
     }
-    buffer.clear();
-    const int numCh = juce::jmin(2, buffer.getNumChannels());
-    const double ratio = (double) IpcClient::kStreamSampleRate / hostSampleRate;
-    const float mk = makeupLin.load();   // make-up gain (linear), applied just before soft-clip out
 
+    buffer.clear();
+
+    // ---- 2) fill the AI output (cover / accompaniment) at host SR; make-up gain, clip deferred ----
     if (std::abs(ratio - 1.0) < 1e-6)
     {
         float* outs[2] = { buffer.getWritePointer(0), numCh > 1 ? buffer.getWritePointer(1) : buffer.getWritePointer(0) };
-        ipc.popAudio(outs, numCh, numOut);
+        ipc.popAudio(outs, numCh, nBlk);
         for (int ch = 0; ch < numCh; ++ch)
         {
             float* d = buffer.getWritePointer(ch);
-            for (int i = 0; i < numOut; ++i) d[i] = softClip(d[i] * mk);
+            for (int i = 0; i < nBlk; ++i) d[i] *= mk;
         }
-        return;
+    }
+    else
+    {
+        const int cap = rsIn.getNumSamples();
+        const int needIn = juce::jmin(cap, (int) std::ceil(nBlk * ratio) + 2);
+        const int popN = juce::jmax(0, needIn - rsLeftover);
+        float* ins[2] = { rsIn.getWritePointer(0) + rsLeftover, rsIn.getWritePointer(1) + rsLeftover };
+        ipc.popAudio(ins, 2, popN);                       // zero-fills on underrun
+        const int avail = rsLeftover + popN;
+        int used = avail;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            used = resampler[ch].process(ratio, rsIn.getReadPointer(juce::jmin(ch, 1)),
+                                         buffer.getWritePointer(ch), nBlk);
+            float* d = buffer.getWritePointer(ch);
+            for (int i = 0; i < nBlk; ++i) d[i] *= mk;
+        }
+        rsLeftover = juce::jmax(0, avail - used);
+        if (rsLeftover > 0)
+            for (int ch = 0; ch < 2; ++ch)
+                juce::FloatVectorOperations::copy(rsIn.getWritePointer(ch),
+                                                  rsIn.getReadPointer(ch) + used, rsLeftover);
     }
 
-    // 48k -> host SR via a persistent windowed-sinc interpolator (clean stopband,
-    // continuous phase + history across blocks). rsIn holds [leftover | fresh]; the
-    // interpolator consumes from the front and we carry the unconsumed tail forward.
-    const int cap = rsIn.getNumSamples();
-    const int needIn = juce::jmin(cap, (int) std::ceil(numOut * ratio) + 2);
-    const int popN = juce::jmax(0, needIn - rsLeftover);
-    float* ins[2] = { rsIn.getWritePointer(0) + rsLeftover, rsIn.getWritePointer(1) + rsLeftover };
-    ipc.popAudio(ins, 2, popN);                       // zero-fills on underrun
-    const int avail = rsLeftover + popN;
-    int used = avail;
+    // ---- 3) mix the dry input monitor (live) + final soft-clip ----
     for (int ch = 0; ch < numCh; ++ch)
     {
-        used = resampler[ch].process(ratio, rsIn.getReadPointer(juce::jmin(ch, 1)),
-                                     buffer.getWritePointer(ch), numOut);
         float* d = buffer.getWritePointer(ch);
-        for (int i = 0; i < numOut; ++i) d[i] = softClip(d[i] * mk);
+        if (monitor)
+        {
+            const float* dry = monBuf.getReadPointer(ch);
+            for (int i = 0; i < nBlk; ++i) d[i] = softClip(d[i] + dry[i]);   // hear input + AI together
+        }
+        else
+        {
+            for (int i = 0; i < nBlk; ++i) d[i] = softClip(d[i]);
+        }
     }
-    rsLeftover = juce::jmax(0, avail - used);          // carry un-consumed input to next block
-    if (rsLeftover > 0)
-        for (int ch = 0; ch < 2; ++ch)
-            juce::FloatVectorOperations::copy(rsIn.getWritePointer(ch),
-                                              rsIn.getReadPointer(ch) + used, rsLeftover);
 }
 
 // ---- control API ----
@@ -222,7 +270,8 @@ void ACE15Processor::startRealtime(const juce::String& tags, double denoise, dou
     o->setProperty("send_bpm", sendBpm);
     o->setProperty("send_key", sendKey);
     o->setProperty("dcw", dcwEnabled);
-    o->setProperty("sr", hostSampleRate);
+    o->setProperty("sr", IpcClient::kStreamSampleRate);   // C++ resamples input to 48k before streaming
+    if (liveStems.isArray() && liveStems.size() > 0) o->setProperty("stems", liveStems);
     ipc.setStreamActive(true);   // accept output (a prior stop may have disabled it)
     ipc.sendControl(m);
     captureInput.store(true);    // stream the live input bus (0x04)
@@ -235,6 +284,14 @@ void ACE15Processor::stopRealtime()
     ipc.flushRing(); ipc.setStreamActive(false);     // silence output + drop in-flight (like a stop)
     ipc.sendControl(makeMsg("live_stop"));           // sidecar tears down the live engine
     playing = false;
+}
+
+void ACE15Processor::setStems(const juce::var& stems)
+{
+    liveStems = stems;                               // remembered for the next live_start
+    auto m = makeMsg("stems");
+    m.getDynamicObject()->setProperty("value", stems);
+    ipc.sendControl(m);                              // live: re-separate from here on
 }
 
 void ACE15Processor::setStyle(const juce::String& tags, double denoise, double character)

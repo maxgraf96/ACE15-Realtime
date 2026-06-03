@@ -70,7 +70,8 @@ def send(type_, payload): sock.sendall(HDR.pack(len(payload), type_) + payload)
 try:
     send(0x01, json.dumps({"cmd": "live_start", "model": "fast", "tags": "warm lo-fi hip hop, dusty drums",
                            "denoise": 0.8, "bpm": 120, "key": "C minor", "sr": SR,
-                           "window": 8.0, "pin": 3.0}).encode())
+                           "window": 8.0, "pin": 3.0,
+                           "stems": (os.environ.get("ACE15_LIVE_STEMS", "").split(",") if os.environ.get("ACE15_LIVE_STEMS") else None)}).encode())
     t0 = time.time()
     while not state["live_started"] and time.time() - t0 < 180:
         time.sleep(0.2)
