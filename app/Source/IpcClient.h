@@ -2,10 +2,12 @@
 //
 // Speaks the framed TCP protocol from sidecar/server.py:
 //   frame = [4-byte big-endian length][1-byte type][payload]
-//     0x01 CONTROL (we send, JSON)
-//     0x02 AUDIO   (we receive, float32 interleaved 4ch @ 48k:
-//                   [coverL,coverR, origL,origR])
-//     0x03 EVENT   (we receive, JSON)
+//     0x01 CONTROL  (we send, JSON)
+//     0x02 AUDIO    (we receive, float32 interleaved 4ch @ 48k:
+//                    [coverL,coverR, origL,origR])
+//     0x03 EVENT    (we receive, JSON)
+//     0x04 AUDIO-IN (we send, float32 interleaved stereo @ host SR — live input
+//                    for real-time mode; the sidecar resamples to 48k)
 //
 // A background net thread receives frames; AUDIO is deinterleaved into a
 // lock-free SPSC ring (AbstractFifo) drained by the audio callback; EVENTs are
@@ -19,6 +21,7 @@
 #include <JuceHeader.h>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <functional>
 
 class IpcClient
@@ -36,6 +39,10 @@ public:
 
     // Message-thread: send a CONTROL JSON line.
     void sendControl(const juce::var& json);
+
+    // Audio-thread: push captured INPUT (host-SR, planar) into a lock-free FIFO that
+    // a sender thread streams to the engine as 0x04 frames (never blocks the RT thread).
+    void pushAudioIn(const float* const* in, int numCh, int n);
 
     // Audio-thread: pull up to n frames into planar out[ch][..]; returns frames provided.
     // Outputs the cover pair, or the original-source pair when bypass is set.
@@ -58,11 +65,15 @@ public:
 
 private:
     void netLoop();
+    void inLoop();   // input-sender thread: drains inFifo -> 0x04 AUDIO-IN frames
     bool recvExact(void* dst, int n);
     void pushAudioInterleaved(const float* inter, int frames, int channels);
+    void writeFrame(unsigned char type, const void* data, int bytes);  // socket write under writeMutex
 
     juce::StreamingSocket socket;
     std::thread thread;
+    std::thread inThread;
+    std::mutex writeMutex;                     // serialize socket writes (control + audio-in)
     std::atomic<bool> running { false };
     std::atomic<bool> connected { false };
     std::atomic<bool> bypass { false };       // A/B: output the original-source pair instead of the cover
@@ -73,6 +84,12 @@ private:
     static constexpr int kRingFrames = kStreamSampleRate * 8; // 8 s jitter buffer
     juce::AbstractFifo fifo { kRingFrames };
     juce::AudioBuffer<float> ring; // [4, kRingFrames] planar: cover pair + original pair
+
+    // Captured INPUT staged at host SR (planar stereo); the inLoop thread interleaves
+    // + ships it as 0x04. The sidecar resamples host->48k.
+    static constexpr int kInRingFrames = 192000 * 4; // 4 s at up to 192 kHz
+    juce::AbstractFifo inFifo { kInRingFrames };
+    juce::AudioBuffer<float> inRing;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IpcClient)
 };

@@ -14,7 +14,9 @@ static inline float softClip(float x) noexcept
 }
 
 ACE15Processor::ACE15Processor()
-    : juce::AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
+    : juce::AudioProcessor(BusesProperties()
+          .withInput("Input", juce::AudioChannelSet::stereo(), true)   // live input for real-time mode
+          .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
     ipc.onEvent = [this](juce::var v)
     {
@@ -81,8 +83,20 @@ void ACE15Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
 
 void ACE15Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
-    buffer.clear();
     const int numOut = buffer.getNumSamples();
+    // Real-time mode: capture live input (host SR) and stream it to the engine BEFORE
+    // overwriting the buffer with output. Off (and no input read) in file/cover mode.
+    if (captureInput.load())
+    {
+        const int nIn = juce::jmin(2, getTotalNumInputChannels());
+        if (nIn > 0 && buffer.getNumChannels() >= nIn)
+        {
+            const float* ins[2] = { buffer.getReadPointer(0),
+                                    nIn > 1 ? buffer.getReadPointer(1) : buffer.getReadPointer(0) };
+            ipc.pushAudioIn(ins, nIn, numOut);
+        }
+    }
+    buffer.clear();
     const int numCh = juce::jmin(2, buffer.getNumChannels());
     const double ratio = (double) IpcClient::kStreamSampleRate / hostSampleRate;
     const float mk = makeupLin.load();   // make-up gain (linear), applied just before soft-clip out
@@ -172,6 +186,55 @@ void ACE15Processor::setInputGain(double db)
 void ACE15Processor::setMakeup(double db)   // -20..+20 dB, applied in processBlock before soft-clip
 {
     makeupLin.store((float) std::pow(10.0, db / 20.0));
+}
+
+// Real-time input mode: start/stop streaming the live input bus to the engine.
+// (Phase A: the sidecar resamples host->48k and captures it; generation comes later.)
+void ACE15Processor::setRealtimeInput(bool on)
+{
+    if (on)
+    {
+        auto m = makeMsg("input_config");
+        m.getDynamicObject()->setProperty("sr", hostSampleRate);
+        m.getDynamicObject()->setProperty("channels", 2);
+        ipc.sendControl(m);
+        ipc.sendControl(makeMsg("input_start"));
+        captureInput.store(true);
+    }
+    else
+    {
+        captureInput.store(false);   // stop pushing first; then tell the sidecar to finalize
+        ipc.sendControl(makeMsg("input_stop"));
+    }
+}
+
+void ACE15Processor::startRealtime(const juce::String& tags, double denoise, double character,
+                                   const juce::String& bpm, const juce::String& key)
+{
+    auto m = makeMsg("live_start");
+    auto* o = m.getDynamicObject();
+    o->setProperty("model", selectedModel);
+    o->setProperty("tags", tags);
+    o->setProperty("denoise", denoise);
+    o->setProperty("character", character);
+    if (bpm.trim().isNotEmpty()) o->setProperty("bpm", bpm.trim());
+    if (key.trim().isNotEmpty()) o->setProperty("key", key.trim());
+    o->setProperty("send_bpm", sendBpm);
+    o->setProperty("send_key", sendKey);
+    o->setProperty("dcw", dcwEnabled);
+    o->setProperty("sr", hostSampleRate);
+    ipc.setStreamActive(true);   // accept output (a prior stop may have disabled it)
+    ipc.sendControl(m);
+    captureInput.store(true);    // stream the live input bus (0x04)
+    playing = true;
+}
+
+void ACE15Processor::stopRealtime()
+{
+    captureInput.store(false);                       // stop streaming input
+    ipc.flushRing(); ipc.setStreamActive(false);     // silence output + drop in-flight (like a stop)
+    ipc.sendControl(makeMsg("live_stop"));           // sidecar tears down the live engine
+    playing = false;
 }
 
 void ACE15Processor::setStyle(const juce::String& tags, double denoise, double character)

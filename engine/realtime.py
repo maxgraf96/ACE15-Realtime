@@ -54,6 +54,9 @@ class RealtimeCover:
         self._seek_pos_s = 0.0         # track-seconds at the last seek (playhead origin)
         self.underruns = 0
         self.full_T = 0
+        self.live = False              # real-time live-input mode (source grows from a stream)
+        self.beats_per_bar = 4         # tempo grid (4/4); bar = 60/bpm * beats_per_bar
+        self._bar_trail_s = 0.0        # achieved output trailing (whole bars) in live mode
         self._running = False
         self._done = False
         self._thread = None
@@ -180,9 +183,22 @@ class RealtimeCover:
         sender/consumer, NOT the producer, so playback position is kept)."""
         return self._running
 
+    # ---- live / streaming input (Phase 3) ----
+    def begin_live(self):
+        """Switch to real-time live-input mode: the source latent grows from feed_input()
+        instead of a preloaded track. Call before set_style()/start()."""
+        self.live = True
+        self.jit.begin_live()
+        return self
+
+    def feed_input(self, pcm_48k):
+        """Append live 48 kHz input (any thread)."""
+        self.jit.feed_live(pcm_48k)
+
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._produce, daemon=True)
+        target = self._produce_live if self.live else self._produce
+        self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
         return self
 
@@ -295,6 +311,99 @@ class RealtimeCover:
             dec_f = dec_target
             self.max_step_ms = max(self.max_step_ms, (time.perf_counter() - t_iter) * 1000)
             keep = (dec_f - base_f) // jit._TILE - 1          # prune decoded tiles behind the playhead
+            for t in [t for t in tiles if t < keep]:
+                del tiles[t]
+            mps_compat.reclaim()
+        self._done = True
+
+    def _produce_live(self):
+        """Live producer: same pinned-prefix rolling cover, but the source latent GROWS
+        from the incoming stream (jit.encode_pending) and the frontier is GATED by the
+        available input — we never generate/decode past what's been captured+encoded. No
+        loop, no seek. Output trails the live input by ~the window + decode headroom."""
+        torch.set_grad_enabled(False)
+        import math
+        from acestep.nodes.types import Latent
+        jit = self.jit
+        # Bar grid from the (manual/host) tempo: generate in whole-bar hops, and below we
+        # round the output up to a whole bar so the cover trails the input by N bars exactly.
+        bpm = float(getattr(jit, "bpm", 120) or 120); bpm = min(220.0, max(40.0, bpm))
+        bar_frames = max(1, round(60.0 / bpm * self.beats_per_bar * FPS))
+        self._pin_f = self._hop_f = bar_frames        # 2-bar window (1-bar pin + 1-bar hop), bar-aligned
+        bar_s = bar_frames / FPS
+        C = max(1, self._pin_f); H = max(1, self._hop_f)
+        headroom = jit._TILE + jit._TOV
+        committed = None; base_f = 0; gen_f = 0; dec_f = 0; tiles = {}
+        aligned = False
+        while self._running:
+            avail = jit.encode_pending()            # rolling-encode new live input (MPS, this thread)
+            if avail > self.full_T: self.full_T = avail
+            jit._ensure_handle()
+            with self._lock:
+                ctrls = list(self._ctrl); self._ctrl.clear()
+                ahead = self._produced_f - self._consumed_f
+            restyled = False
+            for kind, val in ctrls:
+                if kind == "prompt":      jit._set_prompt(val); restyled = True
+                elif kind == "denoise":   jit.denoise = val; restyled = True
+                elif kind == "character": jit.set_character(val); restyled = True
+                elif kind == "metas":     jit.set_metas(send_bpm=val[0], send_key=val[1], bpm=val[2], key=val[3]); restyled = True
+                elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
+                elif kind == "input_gain": jit.input_gain_db = float(val)   # live: applied on feed, no re-encode
+            if restyled and committed is not None and gen_f > dec_f and (dec_f - base_f) >= C:
+                committed = committed[:, :dec_f - base_f, :].contiguous(); gen_f = dec_f
+                tcut = (dec_f - base_f) // jit._TILE
+                tiles = {t: v for t, v in tiles.items() if t < tcut}
+            # wait until the handle exists and the first window's worth of source is captured
+            if jit.handle is None or avail < C + H:
+                time.sleep(0.02); continue
+            # adaptive buffer gate — don't run too far ahead of the consumer
+            target = max(self.lookahead_samp, int(min(8.0, self.max_step_ms / 1000 + 0.4) * SR))
+            if committed is not None and ahead >= target + self.SL * SPF:
+                time.sleep(0.003); continue
+            t_iter = time.perf_counter()
+            # extend the committed (pinned) latent, bounded by available source
+            while True:
+                cur_end = base_f + (committed.shape[1] if committed is not None else 0)
+                if committed is not None and (cur_end >= dec_f + self.SL + headroom or cur_end >= avail):
+                    break
+                if committed is None:
+                    w1 = min(base_f + C + H, avail)
+                    cold = jit._gen(base_f, min(base_f + self._prime_f + C, w1), self.seed).tensor
+                    cp = min(self._prime_f, cold.shape[1] - 1)
+                    committed = jit._gen(base_f, w1, self.seed, pin=cold[:, :cp, :]).tensor
+                    gen_f = base_f + committed.shape[1]
+                else:
+                    w1 = min(gen_f + H, avail)
+                    if w1 - (gen_f - C) < C + 1:    # < 1 new frame of source -> wait for more input
+                        break
+                    new = jit._gen(gen_f - C, w1, self.seed, pin=committed[:, -C:, :]).tensor[:, C:, :]
+                    committed = torch.cat([committed, new], dim=1); gen_f += new.shape[1]
+                self.regens += 1
+            # decode only frames with full context (headroom of generated frames after them)
+            dec_limit = base_f + committed.shape[1] - headroom
+            dec_target = min(dec_f + self.SL, dec_limit)
+            if dec_target <= dec_f:
+                time.sleep(0.005); continue
+            # BAR-QUANTIZE: before the very first cover push, pad the output up to the next
+            # whole bar (relative to what the consumer has already drained) so the cover
+            # trails the live input by an integer number of bars, locked to the grid.
+            if not aligned:
+                L = self._consumed_f / SR
+                target = math.ceil(L / bar_s) * bar_s if L > 1e-3 else bar_s
+                n_sil = int(round((target - L) * SR))
+                if n_sil > 0:
+                    z = torch.zeros(2, n_sil); self._push(z, z)
+                aligned = True
+                self._bar_trail_s = target
+            seg = jit._ensure_tiles(Latent(tensor=committed), tiles, dec_f - base_f, dec_target - base_f)
+            mps_compat.mps_sync()
+            if jit.dcw_enabled: seg = seg * self._dcw_gain
+            orig = jit.source_slice(dec_f, seg.shape[-1])    # A/B = your live input (delayed), same frames
+            self._push(seg, orig)
+            dec_f = dec_target
+            self.max_step_ms = max(self.max_step_ms, (time.perf_counter() - t_iter) * 1000)
+            keep = (dec_f - base_f) // jit._TILE - 1
             for t in [t for t in tiles if t < keep]:
                 del tiles[t]
             mps_compat.reclaim()

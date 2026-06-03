@@ -16,8 +16,10 @@
                 <span class="tag">Realtime cover</span>
             </div>
             <div class="top-right">
+                <button type="button" class="ab-toggle" id="srcmode-toggle"
+                    title="Source mode — File: cover a loaded track. Live: generate a tempo-synced accompaniment from the live audio input (set the input in Options › Audio).">File</button>
                 <button type="button" class="ab-toggle" id="ab-toggle" disabled
-                    title="A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: Cover.">Cover</button>
+                    title="A/B — instantly hear the original instead of the cover (no regeneration). Currently: Cover.">Cover</button>
                 <div class="status" id="status">
                     <span class="dot"></span>
                     <span id="status-text">starting engine…</span>
@@ -68,6 +70,21 @@
                             </span>
                         </div>
                         <div class="srcwave" id="srcwave"></div>
+                    </div>
+                    <div class="source-live" id="source-live">
+                        <div class="srcname">
+                            <b>Live input</b>
+                            <span class="meta-edit">
+                                <input type="text" id="live-bpm" class="metafield" inputmode="numeric" value="120"
+                                    title="Tempo of your playing — sets the bar grid the AI locks to (and the cover's Metas). In a DAW this comes from the host." />
+                                <span class="metaunit">BPM</span>
+                                <span class="metasep">·</span>
+                                <input type="text" id="live-key" class="metafield keyfield" value="C minor"
+                                    title="Key of your playing — feeds the cover's Metas." />
+                            </span>
+                        </div>
+                        <div class="inmeter"><div class="inmeter-fill" id="inmeter-fill"></div></div>
+                        <div class="livehint" id="livehint">press Play to start — the AI trails by a few bars, locked to the grid</div>
                     </div>
                 </section>
 

@@ -168,6 +168,16 @@ input.metafield:focus { border-color: var(--accent); }
 .metaunit { color: var(--muted); font-size: 10px; letter-spacing: 0.06em; }
 .metasep { color: var(--faint); }
 
+/* Live-input panel (real-time mode): tempo/key + input level meter. Shown only in
+   live mode; the file panels (empty/loading/loaded) are hidden then. */
+.source-live { display: none; flex-direction: column; gap: 12px; padding: 4px 0; }
+body.live-mode .source-live { display: flex; }
+body.live-mode #source-empty, body.live-mode #source-loading, body.live-mode #source-loaded { display: none; }
+body.live-mode .source { cursor: default; }
+.inmeter { height: 6px; border-radius: 3px; background: var(--hair); overflow: hidden; margin-top: 6px; }
+.inmeter-fill { height: 100%; width: 0%; background: var(--accent); transition: width .08s linear; }
+.livehint { font-size: 11px; color: var(--faint); }
+
 /* Playback-mode toggle (Loop ↔ One-shot) — sits next to the filename so it
    reads as a property of the source. Subtle by default; warm-taupe when
    set to one-shot. */

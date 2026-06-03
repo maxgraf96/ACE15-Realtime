@@ -32,6 +32,8 @@ const stop        = nf("stop");
 const setBypassFn = nf("setBypass");
 const setInputGainFn = nf("setInputGain");
 const setMakeupFn = nf("setMakeup");
+const startRealtimeFn = nf("startRealtime");
+const stopRealtimeFn = nf("stopRealtime");
 const openFile    = nf("openFile");
 
 // ── DOM ──────────────────────────────────────────────────────────────
@@ -48,11 +50,13 @@ const charEl = $("character"), charVal = $("character-value");
 const stepsEl = $("steps"), stepsVal = $("steps-value");
 const windowEl = $("window"), evolveEl = $("evolve-toggle");
 const playBtn = $("play"), stopBtn = $("stop"), abEl = $("ab-toggle");
+const srcModeBtn = $("srcmode-toggle"), sourceLive = $("source-live");
+const inMeterFill = $("inmeter-fill"), liveBpm = $("live-bpm"), liveKey = $("live-key");
 const dl = $("dl"), dlFill = $("dl-fill");
 const errBanner = $("error-banner"), errText = $("error-text"), errDismiss = $("error-dismiss");
 const filePicker = $("file-picker");
 
-let loaded = false, styled = false, evolve = false;
+let loaded = false, styled = false, evolve = false, liveMode = false, bypass = false;
 let playState = "stopped";   // "stopped" | "playing" | "paused"
 const started = () => playState !== "stopped";   // producer running (play OR pause) -> use live setters
 let playheadEl = null;
@@ -60,7 +64,7 @@ let trackDur = 0;   // seconds, for the m:ss position readout
 
 function setStatus(t, cls) { statusText.textContent = t; statusEl.className = "status" + (cls ? " " + cls : ""); }
 function refresh() {
-  const ready = loaded && styled;
+  const ready = liveMode ? true : (loaded && styled);   // live needs no file, just the engine
   playBtn.disabled = !ready;
   stopBtn.disabled = !ready || playState === "stopped";
   abEl.disabled = !ready;
@@ -144,11 +148,12 @@ async function loadFile(file) {
   const b64 = await fileToBase64(file);
   await uploadAudio(b64, ext);
 }
-sourceEmpty.addEventListener("click", () => filePicker.click());
+sourceEmpty.addEventListener("click", () => { if (!liveMode) filePicker.click(); });
 filePicker.addEventListener("change", () => { if (filePicker.files[0]) loadFile(filePicker.files[0]); });
-document.addEventListener("dragover", (e) => { e.preventDefault(); sourceEl.classList.add("drag"); });
+document.addEventListener("dragover", (e) => { if (liveMode) return; e.preventDefault(); sourceEl.classList.add("drag"); });
 document.addEventListener("dragleave", (e) => { if (e.relatedTarget === null) sourceEl.classList.remove("drag"); });
 document.addEventListener("drop", (e) => {
+  if (liveMode) return;                 // no file drops in live mode
   e.preventDefault(); sourceEl.classList.remove("drag");
   const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
   if (f) loadFile(f);
@@ -223,6 +228,11 @@ bpmToggle.addEventListener("click", () => { sendBpm = !sendBpm; bpmToggle.classL
 keyToggle.addEventListener("click", () => { sendKey = !sendKey; keyToggle.classList.toggle("one-shot", sendKey); pushMetas(); });
 bpmField.addEventListener("change", pushMetas);
 keyField.addEventListener("change", pushMetas);
+// Live tempo/key: while running, update the cover Metas. (The bar grid is fixed at
+// the BPM when Play was pressed; change tempo before Play to move the grid.)
+const pushLiveMetas = () => { if (started()) setMetas(sendBpm, sendKey, liveBpm.value.trim(), liveKey.value.trim()); };
+liveBpm.addEventListener("change", pushLiveMetas);
+liveKey.addEventListener("change", pushLiveMetas);
 
 let model = "quality";   // default = XL (best sound)
 const modelEl = $("model-toggle");
@@ -236,25 +246,54 @@ modelEl.addEventListener("click", () => {
   setModel(model);   // C++ reloads the current track on the new model (downloads XL on first use)
 });
 
-// Play/Pause: toggle between play (start/resume) and pause (keep position).
-// Pause leaves the producer running, so resuming is instant.
+// Transport. FILE mode: Play/Pause (pause keeps position) + Stop (reset). LIVE mode:
+// Play = start listening+generating, Stop = stop (no pause concept live).
 playBtn.addEventListener("click", () => {
+  if (liveMode) { if (playState === "playing") stopLive(); else startLive(); return; }
   if (playState === "playing") { pauseFn(); setTransport("paused"); setStatus("paused"); }
   else { play(); setTransport("playing"); setStatus("playing", "accent"); }
 });
-// Stop: full stop — the engine resets to the start.
 stopBtn.addEventListener("click", () => {
   if (playState === "stopped") return;
-  stop(); setTransport("stopped"); setStatus("ready — press Play");
+  if (liveMode) stopLive(); else { stop(); setTransport("stopped"); setStatus("ready — press Play"); }
 });
-// A/B bypass: hear the original source vs the cover. Instant — the engine streams
-// both (frame-aligned), so this only flips which pair C++ outputs (no regen).
-let bypass = false;
+
+// ── Live mode (real-time input accompaniment) ──────────────────────────
+function startLive() {
+  setStatus("loading model…", "accent");
+  startRealtimeFn(promptEl.value, parseFloat(denoiseEl.value), parseFloat(charEl.value),
+                  liveBpm.value.trim(), liveKey.value.trim());
+  setTransport("playing");
+}
+function stopLive() {
+  stopRealtimeFn();
+  setTransport("stopped"); setStatus("live mode — press Play");
+  inMeterFill.style.width = "0%";
+}
+// Source mode toggle: File (cover a track) <-> Live (accompany the input bus).
+function setSourceMode(live) {
+  if (live === liveMode) return;
+  if (started()) { if (liveMode) stopLive(); else { stop(); setTransport("stopped"); } }
+  liveMode = live;
+  document.body.classList.toggle("live-mode", live);
+  srcModeBtn.textContent = live ? "Live" : "File";
+  srcModeBtn.classList.toggle("ab-on", live);
+  bypass = false; abEl.textContent = "Cover"; abEl.classList.remove("ab-on");
+  stepsEl.disabled = live; windowEl.disabled = live;   // live window is bar-derived
+  modelEl.disabled = live;   // pick the model in File mode before going Live (avoids a mid-live file reload)
+  refresh();
+  setStatus(live ? "live mode — press Play" : (loaded ? "ready — press Play" : "drop a track to begin"));
+}
+srcModeBtn.addEventListener("click", () => setSourceMode(!liveMode));
+
+// A/B: hear the original (file) / your live input (live) vs the cover. Instant —
+// the engine streams both pairs frame-aligned; this just flips which C++ outputs.
 abEl.addEventListener("click", () => {
   bypass = !bypass;
-  abEl.textContent = bypass ? "Original" : "Cover";
+  const src = liveMode ? "Input" : "Original";
+  abEl.textContent = bypass ? src : "Cover";
   abEl.classList.toggle("ab-on", bypass);
-  abEl.title = `A/B — instantly bypass the AI cover and hear the original source (no regeneration). Currently: ${bypass ? "Original" : "Cover"}.`;
+  abEl.title = `A/B — instantly hear the ${src.toLowerCase()} instead of the cover (no regeneration). Currently: ${bypass ? src : "Cover"}.`;
   setBypassFn(bypass);
 });
 
@@ -350,6 +389,19 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
     case "playing": setStatus("playing", "accent"); break;
     case "paused":  setStatus("paused"); break;
     case "stopped": setStatus("ready — press Play"); break;
+    case "live_started":
+      meterEl.hidden = false;
+      setTransport("playing"); setStatus(`live · ${ev.bpm} BPM · ${ev.key}`, "accent");
+      break;
+    case "live_stopped":
+      setTransport("stopped"); setStatus("live mode — press Play");
+      inMeterFill.style.width = "0%";
+      break;
+    case "input_level": {       // live input meter (sqrt for low-level visibility)
+      const w = Math.min(100, Math.sqrt(Math.max(0, ev.peak || 0)) * 100);
+      inMeterFill.style.width = w.toFixed(0) + "%";
+      break;
+    }
     case "stats":
       mBuf.textContent = (ev.buffered_s ?? 0).toFixed(1) + "s";
       mRegens.textContent = ev.regens ?? "–";

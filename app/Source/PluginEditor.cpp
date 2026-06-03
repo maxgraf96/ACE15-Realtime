@@ -85,6 +85,18 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.setMakeup((double) args[0]); completion({});
           })
+          .withNativeFunction("setRealtimeInput", [this](auto args, auto completion)
+          {
+              processor.setRealtimeInput((bool) args[0]); completion({});
+          })
+          .withNativeFunction("startRealtime", [this](auto args, auto completion)
+          {
+              processor.startRealtime(args[0].toString(), (double) args[1], (double) args[2],
+                                      args.size() > 3 ? args[3].toString() : juce::String(),
+                                      args.size() > 4 ? args[4].toString() : juce::String());
+              completion({});
+          })
+          .withNativeFunction("stopRealtime", [this](auto, auto completion) { processor.stopRealtime(); completion({}); })
           .withNativeFunction("setMetas", [this](auto args, auto completion)
           {
               processor.setMetas((bool) args[0], (bool) args[1],

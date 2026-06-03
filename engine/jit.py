@@ -140,7 +140,71 @@ class JITCover:
         gain-scaled waveform. Heavy (full re-encode) — run from the producer thread;
         the ring buffer covers the stall, like one large regen."""
         self.input_gain_db = float(db)
+        if getattr(self, "_live", False):
+            return   # live source has no single waveform to re-encode; gain is applied on feed
         self._encode_source()
+
+    # ---- live / streaming source (Phase 3: real-time input) ----
+    LIVE_CHUNK_F = 25     # latent frames appended per encode step (1.0 s; multiple of SEM_PATCH)
+    LIVE_MARGIN_F = 12    # ~0.48 s overlap each side, discarded — measured near-lossless (rel-err 6e-4)
+
+    def begin_live(self):
+        """Start an EMPTY streaming source, grown by feed_live()+encode_pending(). For
+        real-time live input — bpm/key come from the UI (manual/host), not detection."""
+        import threading as _th
+        self._live = True
+        self._TILE = 16   # smaller decode tiles for live -> less decode headroom -> lower latency
+        self._live_lock = _th.Lock()
+        self._live_raw = torch.zeros(2, 0)   # raw 48k stereo (cpu); also the A/B reference
+        self._enc_f = 0                      # source-latent frames committed so far
+        self.source = None
+        self.source_wav = self._live_raw
+        self.peaks = []
+        self.track_dur = 30.0                # nominal duration meta (open-ended live)
+        return self
+
+    def feed_live(self, pcm):
+        """Append raw 48 kHz input (stereo [2,n] or [n,2], or mono [n]). Thread-safe."""
+        x = pcm if isinstance(pcm, torch.Tensor) else torch.as_tensor(pcm)
+        x = x.float()
+        if x.dim() == 1:
+            x = x.unsqueeze(0).repeat(2, 1)
+        elif x.shape[0] != 2 and x.shape[-1] == 2:
+            x = x.t()
+        x = x.cpu().contiguous()
+        g = 10.0 ** (self.input_gain_db / 20.0)
+        if g != 1.0:
+            x = x * g                        # input-gain trim applied as the stream arrives
+        with self._live_lock:
+            self._live_raw = torch.cat([self._live_raw, x], dim=1)
+            self.source_wav = self._live_raw
+
+    def encode_pending(self):
+        """Encode any newly-complete chunk of pending live audio (overlap-discard) and
+        append it to the streaming source latent + hints. Run from the PRODUCER thread
+        (MPS). Returns the number of source frames now available to generate from."""
+        from acestep.nodes.types import Audio, Latent
+        from acestep.engine.session import PreparedSource
+        cf, mf = self.LIVE_CHUNK_F, self.LIVE_MARGIN_F
+        with self._live_lock:
+            raw = self._live_raw
+        # need audio through (enc_f + cf + mf) frames to cleanly encode chunk [enc_f, enc_f+cf)
+        if raw.shape[1] < (self._enc_f + cf + mf) * SPF:
+            return self._enc_f
+        lo = max(0, self._enc_f - mf)
+        hi = self._enc_f + cf + mf
+        sub = raw[:, lo * SPF: hi * SPF]
+        lat = self.session.encode_audio(Audio(waveform=sub, sample_rate=SR)).tensor   # [1, ~(hi-lo), D]
+        take = self._enc_f - lo                          # left margin frames (0 at the very start)
+        new = lat[:, take: take + cf, :]
+        if new.shape[1] < cf:                            # encoder produced fewer frames than asked
+            return self._enc_f
+        new = new.contiguous()
+        full = new if self.source is None else torch.cat([self.source.latent.tensor, new], dim=1)
+        self._enc_f += cf
+        ctx = self.session.extract_hints(Latent(tensor=full))
+        self.source = PreparedSource(latent=Latent(tensor=full), context_latent=ctx)
+        return self._enc_f
 
     def source_slice(self, f0, n_samples):
         """Original source audio for the slice starting at latent frame f0, exactly
@@ -251,11 +315,16 @@ class JITCover:
         if send_bpm is not None: self.send_bpm = bool(send_bpm)
         if send_key is not None: self.send_key = bool(send_key)
         self._encode()
-        if self.handle is None:
+        self._ensure_handle()   # no-op in live mode until the first chunk is encoded
+        return self
+
+    def _ensure_handle(self):
+        """Build the streaming pipeline handle once a source exists (deferred in live
+        mode, where the source latent only appears after the first encode_pending)."""
+        if self.handle is None and self.source is not None:
             self.handle = self.session.stream(source=self.source, conditioning=self.cond,
                                               steps=self.steps, shift=self.shift, pipeline_depth=1,
                                               **self._dcw_kwargs())
-        return self
 
     def _dcw_kwargs(self):
         """DCW params for session.stream() / handle.base_kwargs (read every tick)."""

@@ -1,9 +1,12 @@
 #include "IpcClient.h"
+#include <vector>
 
 IpcClient::IpcClient()
 {
     ring.setSize(kStreamChannels, kRingFrames);
     ring.clear();
+    inRing.setSize(2, kInRingFrames);
+    inRing.clear();
 }
 
 IpcClient::~IpcClient() { disconnect(); }
@@ -18,6 +21,7 @@ bool IpcClient::connect(const juce::String& host, int port, int retryMs)
             connected = true;
             running = true;
             thread = std::thread([this] { netLoop(); });
+            inThread = std::thread([this] { inLoop(); });
             return true;
         }
         juce::Thread::sleep(150);
@@ -31,6 +35,8 @@ void IpcClient::disconnect()
     socket.close();
     if (thread.joinable())
         thread.join();
+    if (inThread.joinable())
+        inThread.join();
     connected = false;
 }
 
@@ -123,15 +129,61 @@ int IpcClient::popAudio(float* const* out, int numCh, int n)
     return got;
 }
 
-void IpcClient::sendControl(const juce::var& json)
+void IpcClient::writeFrame(unsigned char type, const void* data, int bytes)
 {
     if (! connected) return;
-    const juce::String s = juce::JSON::toString(json, true);
-    const auto utf8 = s.toRawUTF8();
-    const juce::uint32 len = (juce::uint32) s.getNumBytesAsUTF8();
+    const juce::uint32 len = (juce::uint32) bytes;
     unsigned char hdr[5] = {
         (unsigned char) ((len >> 24) & 0xff), (unsigned char) ((len >> 16) & 0xff),
-        (unsigned char) ((len >> 8) & 0xff),  (unsigned char) (len & 0xff), 0x01 };
+        (unsigned char) ((len >> 8) & 0xff),  (unsigned char) (len & 0xff), type };
+    std::lock_guard<std::mutex> lk(writeMutex);   // control + audio-in share the socket
     socket.write(hdr, 5);
-    socket.write(utf8, (int) len);
+    if (bytes > 0) socket.write(data, bytes);
+}
+
+void IpcClient::sendControl(const juce::var& json)
+{
+    const juce::String s = juce::JSON::toString(json, true);
+    writeFrame(0x01, s.toRawUTF8(), (int) s.getNumBytesAsUTF8());
+}
+
+// Audio thread: stage captured input (mono dup'd to stereo) into the lock-free FIFO.
+void IpcClient::pushAudioIn(const float* const* in, int numCh, int n)
+{
+    int s1, z1, s2, z2;
+    inFifo.prepareToWrite(n, s1, z1, s2, z2);   // drops samples if the FIFO is full (sender fell behind)
+    auto fill = [&](int dst, int cnt, int off)
+    {
+        float* l = inRing.getWritePointer(0) + dst;
+        float* r = inRing.getWritePointer(1) + dst;
+        for (int i = 0; i < cnt; ++i) { l[i] = in[0][off + i]; r[i] = numCh > 1 ? in[1][off + i] : in[0][off + i]; }
+    };
+    if (z1 > 0) fill(s1, z1, 0);
+    if (z2 > 0) fill(s2, z2, z1);
+    inFifo.finishedWrite(z1 + z2);
+}
+
+// Sender thread: drain the input FIFO, interleave, ship as 0x04. Polls (no RT thread).
+void IpcClient::inLoop()
+{
+    std::vector<float> buf;
+    while (running)
+    {
+        const int ready = inFifo.getNumReady();
+        if (ready <= 0) { juce::Thread::sleep(4); continue; }
+        const int n = juce::jmin(ready, 2048);
+        int s1, z1, s2, z2;
+        inFifo.prepareToRead(n, s1, z1, s2, z2);
+        buf.resize((size_t) (z1 + z2) * 2);
+        auto pack = [&](int outOff, int cnt, int src)
+        {
+            const float* l = inRing.getReadPointer(0) + src;
+            const float* r = inRing.getReadPointer(1) + src;
+            for (int i = 0; i < cnt; ++i) { buf[(size_t) (outOff + i) * 2] = l[i]; buf[(size_t) (outOff + i) * 2 + 1] = r[i]; }
+        };
+        if (z1 > 0) pack(0, z1, s1);
+        if (z2 > 0) pack(z1, z2, s2);
+        inFifo.finishedRead(z1 + z2);
+        writeFrame(0x04, buf.data(), (int) (buf.size() * sizeof(float)));   // [L,R] interleaved @ host SR
+    }
 }

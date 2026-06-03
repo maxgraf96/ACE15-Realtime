@@ -9,6 +9,9 @@ The JUCE app connects over a local socket and speaks one framed protocol:
                        [coverL,coverR, origL,origR] — the client picks a pair so
                        it can A/B the cover vs the original source instantly)
     type 0x03 EVENT   (server->client, JSON utf8: ready / stats / error)
+    type 0x04 AUDIO-IN(client->server, float32 interleaved stereo PCM @ HOST sr —
+                       live input for real-time mode; the sidecar resamples to 48k.
+                       SR declared via the "input_config" control.)
 
 CONTROL commands (JSON):
   {"cmd":"load","path":"<wav>","seconds":N}      # or {"cmd":"load","pcm_b64":...,"sr":...}
@@ -19,6 +22,7 @@ CONTROL commands (JSON):
   {"cmd":"seek","value":0.5}        # jump to a fractional position (0..1)
   {"cmd":"enhance","tags":"..."}    # rewrite a short style into a rich caption (5Hz LM) -> "enhanced" event
   {"cmd":"play"}  {"cmd":"pause"}   {"cmd":"stop"}   # play/resume · pause (keep pos) · stop (reset to 0)
+  {"cmd":"input_config","sr":48000} {"cmd":"input_start"} {"cmd":"input_stop"}  # real-time live input (0x04)
 
 The audio sender paces at 1x; the client buffers into its own jitter ring and
 drains from the audio callback. Single client (the plugin).
@@ -40,7 +44,7 @@ from engine.realtime import RealtimeCover, SR  # noqa: E402
 
 MODELS = {"fast": "acestep-v15-turbo", "quality": "acestep-v15-xl-turbo"}
 
-T_CONTROL, T_AUDIO, T_EVENT = 0x01, 0x02, 0x03
+T_CONTROL, T_AUDIO, T_EVENT, T_AUDIO_IN = 0x01, 0x02, 0x03, 0x04
 HDR = struct.Struct(">IB")
 
 
@@ -83,6 +87,13 @@ class Connection:
         self.enhancer = None              # prompt-LM subprocess (lazy)
         self._enh_lock = threading.Lock()
         self._stats_on = False            # one stats loop per producer run
+        # ---- real-time live input ----
+        self._in_sr = SR                  # host sample rate of the incoming 0x04 stream
+        self._in_active = False
+        self._in_raw = []                 # list of [n,2] host-SR chunks (Phase A capture path)
+        self._in_host_frames = 0
+        self._in_since_evt = 0
+        self._live_gen = False            # Phase B: route 0x04 into the live engine (feed_input)
 
     def handle(self):
         threading.Thread(target=self._sender, daemon=True).start()
@@ -94,6 +105,8 @@ class Connection:
                 type_, payload = frame
                 if type_ == T_CONTROL:
                     self._on_control(json.loads(payload.decode("utf-8")))
+                elif type_ == T_AUDIO_IN:
+                    self._on_audio_in(payload)
         finally:
             self.close()
 
@@ -231,6 +244,50 @@ class Connection:
                 # prompt enhancer — independent of the cover engine, so handled before
                 # the rc-None guard (works with no track loaded). Runs off-thread.
                 threading.Thread(target=self._do_enhance, args=(msg.get("tags", ""),), daemon=True).start()
+            elif cmd == "input_config":   # real-time live input — independent of a loaded track
+                self._in_sr = int(msg.get("sr", SR))
+            elif cmd == "input_start":
+                self._in_raw = []; self._in_host_frames = 0; self._in_since_evt = 0
+                self._in_active = True
+                self._send_event({"event": "input_started", "sr": self._in_sr})
+            elif cmd == "input_stop":
+                self._in_active = False
+                self._finalize_input_capture()
+            elif cmd == "live_start":
+                # Phase B: real-time live-input cover. Create a LIVE engine (source grows
+                # from the 0x04 stream) and start it. Initial style is set BEFORE start()
+                # so no MPS runs concurrently with the producer; live edits use the queued
+                # setters (prompt/denoise/character/metas) like file mode.
+                model = msg.get("model", "fast"); cfg = MODELS.get(model, MODELS["fast"])
+                self._ensure_models(model)
+                if self.rc is not None:
+                    try: self.rc.close()
+                    except Exception: pass
+                    self.rc = None
+                self._send_event({"event": "loading", "stage": "model"})
+                self.rc = RealtimeCover(device="mps", steps=msg.get("steps", 8),
+                                        window_s=msg.get("window", 8.0), pin_s=msg.get("pin", 3.0),
+                                        lookahead_s=msg.get("lookahead", 1.0), config_path=cfg)
+                self.rc.begin_live()
+                if msg.get("dcw"):
+                    self.rc.jit.set_dcw(enabled=True)
+                self.rc.set_style(msg.get("tags", ""), denoise=msg.get("denoise", 0.8),
+                                  character=msg.get("character", 0.0),
+                                  send_bpm=msg.get("send_bpm", True), send_key=msg.get("send_key", True),
+                                  bpm=msg.get("bpm"), key=msg.get("key"))
+                self._in_sr = int(msg.get("sr", SR)); self._in_active = True; self._live_gen = True
+                self.rc.start(); self.playing = True
+                if not self._stats_on:
+                    self._stats_on = True
+                    threading.Thread(target=self._stats_loop, daemon=True).start()
+                self._send_event({"event": "live_started", "bpm": self.rc.jit.bpm, "key": self.rc.jit.key})
+            elif cmd == "live_stop":
+                self._live_gen = False; self._in_active = False; self.playing = False
+                if self.rc is not None:
+                    try: self.rc.close()
+                    except Exception: pass
+                    self.rc = None
+                self._send_event({"event": "live_stopped"})
             elif self.rc is None:
                 return   # no track loaded yet — control commands no-op (UI re-sends state on load)
             elif cmd == "style":
@@ -281,6 +338,61 @@ class Connection:
                 self._send_event({"event": "stopped"})
         except Exception as e:
             _send_json(self.sock, T_EVENT, {"event": "error", "cmd": cmd, "msg": str(e)})
+
+    def _resample_in_48k(self, x_n2):
+        """Host-SR stereo [n,2] -> 48k [m,2]. Passthrough at 48k; else per-chunk sinc
+        (minor chunk seams — fine for now; a continuous C++-side resample is a later
+        refinement). The headless engine gate feeds 48k directly so it's unaffected."""
+        if self._in_sr == SR:
+            return x_n2
+        import torch, torchaudio.functional as AF
+        return AF.resample(torch.from_numpy(x_n2.T.copy()).float(), self._in_sr, SR).T.numpy()
+
+    def _on_audio_in(self, payload):
+        """Live input (0x04): in Phase-B live mode, resample host->48k and FEED the live
+        engine (it rolling-encodes + generates). Otherwise (Phase A) accumulate for the
+        capture WAV. Emits ~10 Hz level events either way."""
+        import numpy as np
+        x = np.frombuffer(payload, dtype=np.float32)
+        if x.size < 2:
+            return
+        x = x.reshape(-1, 2)
+        if self._live_gen and self.rc is not None:
+            self.rc.feed_input(self._resample_in_48k(x))
+        elif self._in_active:
+            self._in_raw.append(x.copy())
+        else:
+            return
+        self._in_host_frames += x.shape[0]
+        self._in_since_evt += x.shape[0]
+        if self._in_since_evt >= max(1, self._in_sr // 10):   # ~10 Hz level meter
+            self._in_since_evt = 0
+            self._send_event({"event": "input_level",
+                              "rms": round(float(np.sqrt(np.mean(x ** 2))), 4),
+                              "peak": round(float(np.abs(x).max()), 4),
+                              "secs": round(self._in_host_frames / self._in_sr, 2)})
+
+    def _finalize_input_capture(self):
+        """On input_stop: resample the whole captured buffer host->48k in one pass (no
+        per-chunk seams) and write a WAV so the input path can be verified end-to-end."""
+        import numpy as np
+        if not self._in_raw:
+            self._send_event({"event": "input_captured", "secs": 0.0})
+            return
+        raw = np.concatenate(self._in_raw, axis=0)            # [N,2] @ host SR
+        if self._in_sr != SR:
+            import torch, torchaudio.functional as AF
+            y = AF.resample(torch.from_numpy(raw.T).float(), self._in_sr, SR).T.numpy()
+        else:
+            y = raw
+        import os, soundfile as sf
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        outdir = os.path.join(root, "test_output", "diag"); os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(outdir, "rt_input_capture.wav")
+        sf.write(path, y, SR)
+        self._in_raw = []
+        print(f"[sidecar] captured live input -> {path} ({len(y)/SR:.2f}s @48k from {self._in_sr})", flush=True)
+        self._send_event({"event": "input_captured", "secs": round(len(y) / SR, 2), "path": path})
 
     def _load_pcm(self, pcm_nx2, sr, seconds):
         # Upload path (plugin drag-drop). Write a temp wav and load via the engine.

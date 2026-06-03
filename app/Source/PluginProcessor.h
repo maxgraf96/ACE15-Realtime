@@ -50,6 +50,11 @@ public:
     void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track
     void setInputGain(double db);   // trim feeding the model (<=0 dB); re-encodes the source
     void setMakeup(double db);      // make-up gain right before audio-out (-20..+20 dB)
+    void setRealtimeInput(bool on); // (Phase A) stream the input bus to the engine (capture only)
+    // Real-time live mode: start/stop generating a live accompaniment from the input bus.
+    void startRealtime(const juce::String& tags, double denoise, double character,
+                       const juce::String& bpm, const juce::String& key);
+    void stopRealtime();
     void play();    // play / resume (keeps position)
     void pause();   // pause — keep position
     void stop();    // full stop — reset to the start
@@ -83,6 +88,7 @@ private:
     int rsLeftover = 0;                  // un-consumed input samples held at the front of rsIn
     bool playing = false;
     std::atomic<float> makeupLin { 1.0f };  // make-up gain (linear), applied just before output
+    std::atomic<bool> captureInput { false }; // real-time mode: stream the live input bus to the engine
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ACE15Processor)
 };
