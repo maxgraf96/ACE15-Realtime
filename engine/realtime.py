@@ -16,7 +16,7 @@ from collections import deque
 import numpy as np
 
 from . import mps_compat
-from .jit import JITCover, FPS, SR, SPF
+from .jit import JITCover, FPS, SR, SPF, SEM_PATCH, _eq
 
 import torch  # noqa: E402
 
@@ -58,13 +58,41 @@ class RealtimeCover:
         self.beats_per_bar = 4         # tempo grid (4/4); bar = 60/bpm * beats_per_bar
         self.live_pin_bars = 1         # live window = (pin + hop) bars; bigger = more context, more latency
         self.live_hop_bars = 1
-        self.live_anchor_bars = 4      # re-anchor the roll to a fresh source-cover every N bars (0 = never)
+        # Live warble fix = TWO layers: (1) seamless windowed source re-encode
+        # (jit.enc_lat_mode="window") kills the chunk-seam perturbation; (2) the pinned roll
+        # is BISTABLE (bf16 nondeterminism tips it into runaway warble ~half the time), so we
+        # FULLY re-anchor every N bars: cold-prime a complete fresh window from source so the
+        # pin resets to 100% source-derived (like file mode's per-loop restart). Enabled by
+        # holding the output a full window (~2 bars) behind the input. 4 bars resets often
+        # enough that drift never accumulates between resets, at half the re-anchor cost of 2.
+        self.live_anchor_bars = 4      # 0 = off
+        # LOOP-COVER mode: if the live input is a loop, auto-detect it and cover it like a
+        # FILE (clean) streamed phase-locked (low latency) — the non-causal model's missing
+        # "future" is supplied by the loop itself. Falls back to continuous mode when no loop.
+        self.loop_enable = True
+        self.loop_min_conf = 0.90      # autocorrelation confidence to accept a loop
+        self.loop_listen_s = 28.0      # stay SILENT (AI "listens", you hear your dry input) up to this
+                                       # long while detecting+rendering the loop -> no warble before lock;
+                                       # if no loop appears by then, fall back to continuous (non-loop input)
+        self.loop_bars_hint = 0        # >0 = MANUAL loop length (bars): skip auto-detect, lock after 1 loop
+        self.loop_locked = False       # telemetry: currently streaming a locked loop cover
+        self.loop_bars = 0
+        self.loop_lead_s = 0.0         # play the cover this far AHEAD of the input phase (compensate the
+                                       # input+output round-trip latency so the AI isn't audibly behind)
+        self.restyling = False         # telemetry: re-rendering the loop cover (Style/loop change) in the bg
+        self._pending_cover = None     # bg re-render result handed back to the producer
+        self._rendering = False        # a bg re-render is in flight
+        self._restyle_pending = False  # a new Style/loop change arrived during a bg re-render
+        self._restem = False           # stem mute/solo changed -> re-separate the locked loop cover
+        self._pending_stems = None     # bg stem re-separation result handed back to the producer
         self._bar_trail_s = 0.0        # achieved output trailing (whole bars) in live mode
         self._running = False
         self._done = False
         self._thread = None
         # telemetry
         self.regens = 0
+        self.reanchors = 0             # live drift-reset re-anchors performed
+        self.anchor_skips = 0          # re-anchor was due but source/zone too small (gate blocked)
         self.max_step_ms = 0.0
 
     # ---- setup ----
@@ -159,7 +187,9 @@ class RealtimeCover:
             pos = (self._seek_pos_s + played) % dur   # playhead = seek origin + elapsed
         return {"buffered_s": round(buffered, 2), "regens": self.regens,
                 "worst_regen_ms": round(self.max_step_ms), "underruns": self.underruns,
-                "progress": pos / dur, "duration_s": round(dur, 1)}
+                "progress": pos / dur, "duration_s": round(dur, 1),
+                "loop_locked": bool(self.loop_locked), "loop_bars": int(self.loop_bars),
+                "restyling": bool(self.restyling)}
 
     # ---- consumer (audio thread) ----
     def read(self, n):
@@ -201,12 +231,117 @@ class RealtimeCover:
         """Switch to real-time live-input mode: the source latent grows from feed_input()
         instead of a preloaded track. Call before set_style()/start()."""
         self.live = True
+        self.loop_locked = False; self.loop_bars = 0; self.restyling = False
+        self._pending_cover = None; self._rendering = False; self._restyle_pending = False
+        self._restem = False; self._pending_stems = None
+        with self._lock:
+            self._ctrl.clear()       # drop stale queued ctrls so a kept-alive engine restarts clean
         self.jit.begin_live()
         return self
+
+    def _refine_period(self, P0, frac=0.08):
+        """Measure the loop period to sample precision near P0 (the bars*60/bpm estimate). The DAW's
+        real loop length almost never equals bars*60/bpm exactly (file/region length, tempo a hair
+        off), and that tiny mismatch makes the cover DRIFT against the input over many loops. Returns
+        the normalized-autocorrelation peak lag within +/-frac of P0 (falls back to P0 if too little
+        captured). Run from the producer thread (cheap CPU FFT)."""
+        md = max(1, int(P0 * frac))
+        with self.jit._live_lock:
+            n = self.jit._live_raw.shape[1]
+            take = min(n, 2 * P0 + md)
+            if take < P0 + md + P0 // 4:                  # need ~1.3 loops for a reliable peak
+                return P0
+            mono = self.jit._live_raw[:, -take:].mean(0).cpu().numpy().astype(np.float64)
+        mono -= mono.mean()
+        L = 1
+        while L < 2 * len(mono):
+            L *= 2
+        f = np.fft.rfft(mono, L)
+        ac = np.fft.irfft(f * np.conj(f), L)[:len(mono)]
+        ac = ac / np.maximum(np.arange(len(mono), 0, -1), 1)   # normalize by overlap (de-bias the decay)
+        lo, hi = max(1, P0 - md), min(len(mono) - 1, P0 + md)
+        if hi <= lo:
+            return P0
+        return int(np.argmax(ac[lo:hi + 1])) + lo
+
+    def _apply_stems(self, full_np):
+        """OUTPUT stem mixer for the locked loop cover [P,2]: if a stem SUBSET is selected, separate
+        (Demucs) and keep only those, else return the full mix. Tiled x3 (take the middle) so the
+        loop boundary keeps full context -> seamless. Cheap (~RTF 0.01); MPS, so the caller runs it
+        only when no background render is in flight (avoid concurrent GPU use)."""
+        from .separation import STEMS
+        st = self.jit.stems
+        if not st or set(st) >= set(STEMS):
+            return full_np
+        P = full_np.shape[0]
+        t = torch.from_numpy(np.concatenate([full_np, full_np, full_np], 0).T).contiguous()  # [2,3P]
+        mix = self.jit._ensure_sep().separate(t, st)
+        return mix[:, P:2 * P].detach().t().contiguous().cpu().float().numpy()                 # [P,2]
+
+    def set_loop_bars(self, n):
+        """Manual loop length in bars (0 = auto-detect). Queued; applied by the producer."""
+        with self._lock:
+            self._ctrl.append(("loop_bars", float(n)))
+
+    def set_loop_lead(self, ms):
+        """Nudge the loop cover by this many ms (SIGNED) against the input phase: +ms plays it
+        EARLIER (cancel the input+output round-trip lag so the AI isn't behind), -ms plays it
+        LATER (pull it back if it lands ahead). Queued; applied by the producer."""
+        with self._lock:
+            self._ctrl.append(("loop_lead", float(ms)))
 
     def feed_input(self, pcm_48k):
         """Append live 48 kHz input (any thread)."""
         self.jit.feed_live(pcm_48k)
+
+    def _render_loop_cover(self, start_a, period_s, seed):
+        """Render a clean cover of the loop [start_a, start_a+period_s), for LOOP-COVER mode.
+        `start_a` is ONSET-ALIGNED (onset + k*period), so cover frame i maps to the loop's
+        onset-phase i -> the cover plays phase-locked to the input, no cross-correlation. The
+        non-causal model needs future context the live edge lacks, AND it would generate a song-
+        ENDING (decrescendo) at the source's end. Both are solved by TILING the loop x3 and taking
+        the MIDDLE copy: it has loop content before AND after, so the model neither winds down nor
+        starts weak. RESAMPLE to EXACTLY period_s so it tiles forever without drift. One-shot.
+        Returns (cover_pcm [period_s,2], orig_pcm [period_s,2]) or None."""
+        jit = self.jit
+        import torchaudio.functional as AF
+        from acestep.nodes.types import Audio, Latent
+        from acestep.engine.session import PreparedSource
+        with jit._live_lock:
+            if start_a + period_s > jit._live_raw.shape[1]:
+                return None
+            loop = jit._live_raw[:, start_a: start_a + period_s].contiguous()   # one onset-aligned loop
+        raw3 = torch.cat([loop, loop, loop], 1)                # tile x3 (the loop repeats -> seamless joins)
+        lat = jit.session.encode_audio(Audio(waveform=raw3, sample_rate=SR)).tensor
+        Pf = (lat.shape[1] // 3 // SEM_PATCH) * SEM_PATCH      # encoded frames per loop (multiple of 5)
+        if Pf < 5:
+            return None
+        lat = lat[:, :3 * Pf, :].contiguous()
+        ctx = jit.session.extract_hints(Latent(tensor=lat))
+        saved_src, saved_handle, saved_tile = jit.source, jit.handle, jit._TILE
+        try:
+            jit.source = PreparedSource(latent=Latent(tensor=lat), context_latent=ctx)
+            jit._encode()                                      # rebuild cond w/ the latest Style AND a valid
+            #            source for _refer() (Character timbre ref) — must run with jit.source set, on THIS
+            #            (background) thread so it's serialized with the render's other GPU work.
+            jit.handle = jit.session.stream(source=jit.source, conditioning=jit.cond, steps=jit.steps,
+                                            shift=jit.shift, pipeline_depth=1, **jit._dcw_kwargs())
+            jit._TILE = 48                                      # full-quality decode for the one-shot render
+            cover, _ = jit.render(window_s=min(20.0, 3 * Pf / FPS), lookahead_s=1.0,
+                                  slice_s=1.0, xfade_s=0.12, seed=seed)
+        finally:
+            jit.source, jit.handle, jit._TILE = saved_src, saved_handle, saved_tile
+        if jit.dcw_enabled:
+            cover = cover * self._dcw_gain
+        cov = cover[:, Pf * SPF: 2 * Pf * SPF].contiguous()    # the MIDDLE loop (full context, no ending/weak start)
+        if cov.shape[1] != period_s:                           # lock the loop length to the exact period
+            cov = AF.resample(cov, cov.shape[1], period_s)
+        cov = cov[:, :period_s]
+        if cov.shape[1] < period_s:                            # pad a hair if resample rounded short
+            cov = torch.cat([cov, cov[:, :period_s - cov.shape[1]]], 1)
+        cov = cov.detach().t().contiguous().cpu().float().numpy()                  # [period_s, 2]
+        org = loop[:, :period_s].detach().t().contiguous().cpu().float().numpy()   # the onset-aligned input loop
+        return cov, org
 
     def start(self):
         self._running = True
@@ -228,6 +363,14 @@ class RealtimeCover:
             self._ring.clear(); self._ring_frames = 0
             self._produced_f = 0; self._consumed_f = 0; self._real_f = 0
             self._seek_pos_s = 0.0
+
+    def _push_np(self, cov, org):
+        """Append pre-rendered loop PCM: cov/org are [n,2] float32 (cover, original)."""
+        chunk = np.concatenate([cov, org], axis=1).astype(np.float32)   # [n,4]
+        with self._lock:
+            self._ring.append(chunk)
+            self._ring_frames += chunk.shape[0]
+            self._produced_f += chunk.shape[0]
 
     def _push(self, cover_2xN, orig_2xN):
         cov = cover_2xN.detach().t().contiguous().numpy().astype(np.float32)  # [N,2]
@@ -348,35 +491,245 @@ class RealtimeCover:
         C = max(1, self._pin_f); H = max(1, self._hop_f)
         headroom = jit._TILE + jit._TOV
         anchor_period = bar_frames * self.live_anchor_bars   # 0 = never re-anchor
+        reanchor_win = C + H   # full re-anchor window = the source lead we hold ahead of the decode
+                               # point so a whole fresh window always fits -> full (pure-fresh) reset
         committed = None; base_f = 0; gen_f = 0; dec_f = 0; tiles = {}
         anchor_f = 0
         aligned = False
+        # loop-cover state. Phase is anchored to jit._onset (the loop's hard start = first audible
+        # input sample), so it's deterministic + stable — no cross-correlation, no re-align jitter.
+        loop_cov = None; loop_full = None; loop_org = None; loop_P = 0   # loop_full = full mix; loop_cov = stem-mixed
+        last_detect = -10 ** 9
+        detect_every = int(bar_s * SR)          # re-check for a loop ~once per bar
+        give_up = not self.loop_enable          # no loop found in time -> continuous fallback
+        cont_started = False                    # one-time start-point reset when continuous takes over
+        self.loop_locked = False
+
+        def _exact_period(bars):
+            return int(round(bars * (60.0 / bpm) * self.beats_per_bar * SR))   # exact sample period
+
+        def _aligned_start(onset, P):
+            """Start of the most recent COMPLETE onset-aligned loop [a, a+P] within the buffer."""
+            m = (jit._live_raw.shape[1] - onset) // P - 1
+            return onset + max(0, m) * P
+
+        def _lock_loop(start_a, P, B):
+            """Render the onset-aligned loop cover once (blocking; the ring covers it). Returns
+            (cov, org, P) or None. Cover frame i maps to onset-phase i -> deterministic playback."""
+            res = self._render_loop_cover(start_a, P, self.seed)
+            if not res:
+                return None
+            self.loop_bars = B
+            return res[0], res[1], P
+
+        def _spawn_rerender(start_a, P, B):
+            """Re-render the (onset-aligned) loop cover in a BACKGROUND thread (Style/loop change)
+            while the producer keeps streaming the OLD cover -> no audio dropout, just a 'restyling'
+            status. Safe: in loop mode the producer does no MPS, so the render owns the GPU."""
+            if self._rendering:
+                self._restyle_pending = True       # coalesce: render again once this one finishes
+                return
+            self._rendering = True; self.restyling = True
+            def work():
+                torch.set_grad_enabled(False)          # grad flag is THREAD-LOCAL; disable in this worker
+                try:
+                    res = self._render_loop_cover(start_a, P, self.seed)   # re-encodes (Style) internally
+                    if res:
+                        cov = self._apply_stems(res[0])      # apply current stems in the BG (no main stall)
+                        self._pending_cover = (res[0], cov, res[1], P, B)
+                except Exception:
+                    pass
+                finally:
+                    self._rendering = False
+            threading.Thread(target=work, daemon=True).start()
+
+        def _spawn_restem(full):
+            """Re-separate the locked cover for new stem mute/solo in a BACKGROUND thread (no producer
+            stall) while the old cover keeps streaming. Shares `_rendering` as the GPU mutex so it never
+            runs concurrently with a re-render. On completion -> _pending_stems (swapped + flushed)."""
+            if self._rendering or full is None:
+                return                                 # GPU busy / not locked yet -> retry next tick
+            self._restem = False
+            self._rendering = True
+            def work():
+                torch.set_grad_enabled(False)
+                try:
+                    self._pending_stems = self._apply_stems(full)
+                except Exception:
+                    pass
+                finally:
+                    self._rendering = False
+            threading.Thread(target=work, daemon=True).start()
+
+        def _loop_loud(period_s):
+            """Is the WHOLE recent loop (period_s) loud — every bar above the floor? Guards the
+            lock against silence AND partial silence (audio that only just started), so the
+            captured loop is fully populated -> a clean, non-silent cover from the first lock."""
+            bs = bar_frames * SPF
+            n = min(jit._live_raw.shape[1], max(period_s, bs))
+            if n < bs:
+                return False
+            with jit._live_lock:
+                seg = jit._live_raw[:, -n:].float()
+            for i in range(n // bs):                              # every bar must have signal
+                if float(seg[:, i * bs:(i + 1) * bs].pow(2).mean().sqrt()) < 1.5e-3:   # ~ -56 dB
+                    return False
+            return True
         while self._running:
-            avail = jit.encode_pending()            # rolling-encode new live input (MPS, this thread)
-            if avail > self.full_T: self.full_T = avail
-            jit._ensure_handle()
             with self._lock:
                 ctrls = list(self._ctrl); self._ctrl.clear()
                 ahead = self._produced_f - self._consumed_f
-            restyled = False
+            restyled = False; need_encode = False
+            # In LOOP mode, DEFER the (MPS) conditioning re-encode to the background re-render
+            # thread. Running it here on the producer thread races the bg render's MPS (two
+            # threads submitting GPU kernels) -> the engine hangs/crashes (this is what stopped
+            # playback when the Amount/Character sliders were dragged). Continuous/file mode has
+            # no bg render, so encode immediately. dcw/stems/gain don't re-encode.
+            in_loop = loop_cov is not None
             for kind, val in ctrls:
-                if kind == "prompt":      jit._set_prompt(val); restyled = True
-                elif kind == "denoise":   jit.denoise = val; restyled = True
-                elif kind == "character": jit.set_character(val); restyled = True
-                elif kind == "metas":     jit.set_metas(send_bpm=val[0], send_key=val[1], bpm=val[2], key=val[3]); restyled = True
+                if kind == "prompt":      jit.tags = val; restyled = need_encode = True
+                elif kind == "denoise":   jit.denoise = float(val); restyled = True
+                elif kind == "character": jit.character = float(val); restyled = need_encode = True
+                elif kind == "metas":
+                    jit._set_bpm_key(val[2], val[3])
+                    if val[0] is not None: jit.send_bpm = bool(val[0])
+                    if val[1] is not None: jit.send_key = bool(val[1])
+                    restyled = need_encode = True
                 elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
                 elif kind == "input_gain": jit.input_gain_db = float(val)   # live: applied on feed, no re-encode
-                elif kind == "stems":     jit.set_stems(val)   # source separation; affects future encode chunks
+                elif kind == "stems":     jit.set_stems(val); self._restem = True   # re-separate the locked cover
+                elif kind == "loop_bars": self.loop_bars_hint = max(0.0, float(val)); restyled = True
+                elif kind == "loop_lead": self.loop_lead_s = float(val) / 1000.0   # ms -> s, signed (no re-render);
+                #                          +ms = play the cover EARLIER (cancel round-trip lag), -ms = LATER
+            if need_encode and not in_loop:
+                jit._encode()                                  # continuous/file: apply the new style now
+            fed_s = jit._live_raw.shape[1]
+            # ===== LOOP-COVER MODE: stream the locked loop cover, phase-synced (low latency).
+            # Re-render (brief stall, ring covers it) on a Style change or a loop change. =====
+            if self.loop_enable and loop_cov is not None:
+                onset = jit._onset
+                # swap in a finished background re-render (glitch-free: old cover streamed until now).
+                # full mix + stem-applied cover were both computed in the bg -> no producer-thread Demucs.
+                if self._pending_cover is not None:
+                    full, cov, org, P, B = self._pending_cover; self._pending_cover = None
+                    loop_full, loop_cov, loop_org, loop_P, self.loop_bars = full, cov, org, P, B
+                    self.restyling = False
+                # stem mute/solo: when the BACKGROUND re-separation finishes, swap it in and DROP the
+                # buffered old-stem audio so the toggle is heard near-instantly (phase stays aligned).
+                if self._pending_stems is not None:
+                    loop_cov = self._pending_stems; self._pending_stems = None
+                    with self._lock:
+                        self._ring.clear(); self._ring_frames = 0
+                        self._produced_f = self._consumed_f                # ahead->0, ring empty (phase: rd=0)
+                    ahead = 0                        # refill with the new stems THIS iteration (no gap)
+                # kick off the bg re-separation on a stem change (re-uses the SAME cover; no re-gen)
+                if self._restem:
+                    _spawn_restem(loop_full)
+                # re-render trigger: Style change, manual loop-bars change (both set restyled), or a
+                # detected loop-length change. Runs in the BACKGROUND; old cover keeps streaming.
+                redo = restyled
+                if (not redo and not self._rendering and self.loop_bars_hint <= 0
+                        and fed_s - last_detect >= detect_every):
+                    last_detect = fed_s                                    # auto: re-render if the loop LENGTH changed
+                    Pc, _, _ = jit.detect_loop(thresh=self.loop_min_conf)
+                    redo = bool(Pc) and abs(Pc - loop_P) > int(0.04 * loop_P)
+                if redo or (self._restyle_pending and not self._rendering):
+                    if not redo:
+                        self._restyle_pending = False                     # consume the queued change
+                    if redo and not restyled and self.loop_bars_hint <= 0:   # auto loop-LENGTH change -> re-measure
+                        Pd, _, Bd = jit.detect_loop(thresh=self.loop_min_conf)
+                        Pn, Bn = (self._refine_period(Pd), Bd) if Pd else (loop_P, self.loop_bars)
+                    else:                                                 # Style/queued: SAME loop, reuse precise P
+                        Pn, Bn = loop_P, self.loop_bars
+                    if onset >= 0 and (jit._live_raw.shape[1] - onset) >= Pn:
+                        _spawn_rerender(_aligned_start(onset, Pn), Pn, Bn)
+                # stream PHASE-LOCKED TO THE ONSET: cover frame i == onset-phase i, so the cover for
+                # onset-phase (now + ring + lead) keeps the AI aligned to the input grid. The ring is
+                # phase-compensated (no added latency); `loop_lead_s` compensates round-trip latency.
+                tgt = int(2.0 * SR); lead = int(self.loop_lead_s * SR)
+                if ahead < tgt + self.SL * SPF:
+                    with self._lock:
+                        rd = self._ring_frames
+                    ph = ((fed_s - onset + rd + lead) % loop_P) if onset >= 0 else 0
+                    n = min(self.SL * SPF, loop_P - ph)
+                    self._push_np(loop_cov[ph:ph + n], loop_org[ph:ph + n])
+                else:
+                    time.sleep(0.003)
+                continue
+            # ===== NOT LOCKED: try to lock a loop; stay SILENT ("listening", you hear your dry
+            # input) meanwhile so there's NO warble before the lock. Fall back to continuous only
+            # if no loop ever appears (non-looped live input). =====
+            if not give_up:
+                locked = None; onset = jit._onset
+                # Anchor to the ONSET (loop hard start). Lock once >= 2 onset-aligned loops are
+                # captured AND loud (clean, onset-aligned cover; never onto silence/partial silence).
+                if onset >= 0 and jit.cond is not None:
+                    if self.loop_bars_hint > 0:                 # known length -> lock after ~1.3 loops
+                        Bn = int(round(self.loop_bars_hint)); P0 = _exact_period(Bn)
+                        if P0 > 0 and (fed_s - onset) >= (P0 * 4) // 3 and _loop_loud(P0):
+                            P = self._refine_period(P0)         # MEASURE the true period (no drift)
+                            locked = _lock_loop(_aligned_start(onset, P), P, Bn)
+                    elif fed_s - last_detect >= detect_every:   # auto: detect_loop already needs ~2 loops
+                        last_detect = fed_s
+                        Pd, cd, Bd = jit.detect_loop(thresh=self.loop_min_conf)
+                        if Pd and (fed_s - onset) >= (Pd * 4) // 3 and _loop_loud(Pd):
+                            P = self._refine_period(Pd)
+                            locked = _lock_loop(_aligned_start(onset, P), P, Bd)
+                if locked:
+                    loop_full, loop_org, loop_P = locked       # full mix
+                    loop_cov = self._apply_stems(loop_full)    # apply the current stem mute/solo
+                    self.loop_locked = True
+                    continue
+                # keep the AI channel SILENT while listening (a manual hint always waits for its lock)
+                if self.loop_bars_hint > 0 or fed_s < int(self.loop_listen_s * SR):
+                    if ahead < max(self.lookahead_samp, int(1.0 * SR)):
+                        z = np.zeros((self.SL * SPF, 2), dtype=np.float32)
+                        self._push_np(z, z)
+                    else:
+                        time.sleep(0.005)
+                    continue
+                give_up = True                       # no loop in time -> continuous fallback
+            # ===== CONTINUOUS MODE (non-looped input): rolling-encode + window+re-anchor cover =====
+            avail = jit.encode_pending()            # rolling-encode new live input (MPS, this thread)
+            if avail > self.full_T: self.full_T = avail
+            jit._ensure_handle()
+            if not cont_started:                    # cover the RECENT input, not the whole listen buffer
+                cont_started = True
+                base_f = gen_f = dec_f = max(0, avail - reanchor_win - headroom)
+                committed = None; tiles = {}; anchor_f = base_f; aligned = False
             if restyled and committed is not None and gen_f > dec_f and (dec_f - base_f) >= C:
                 committed = committed[:, :dec_f - base_f, :].contiguous(); gen_f = dec_f
                 tcut = (dec_f - base_f) // jit._TILE
                 tiles = {t: v for t, v in tiles.items() if t < tcut}
-            # RE-ANCHOR: the pinned roll accumulates error over many hops (drift -> warble).
-            # Periodically discard the drifted `committed` and re-prime a FRESH source-derived
-            # window at the playhead (like the file producer's loop restart) so drift can't grow.
-            if (anchor_period and committed is not None and (dec_f - anchor_f) >= anchor_period
-                    and (avail - dec_f) >= C + H):
-                committed = None; base_f = gen_f = dec_f; tiles = {}; anchor_f = dec_f
+            # RE-ANCHOR (full drift reset): the pinned roll is BISTABLE — pinning each hop to
+            # its OWN prior output, it can tip into runaway warble (bf16-sensitive, ~half the
+            # time; not a timing/buffer artifact). File mode escapes this by cold-priming a
+            # FRESH window from source at every loop restart; we do the same. Because we hold
+            # the output a full window (reanchor_win) behind the input (see the decode gate),
+            # there is always a whole window of source ahead of the decode point, so every
+            # `anchor_period` we regenerate a FULL 2-pass cold-prime window [dec_f, dec_f+win]
+            # (from source, NOT the drifted committed) and equal-power latent-crossfade it over
+            # the small UNDECODED zone. The new pin (committed[-C:]) then lands entirely in the
+            # fresh region -> the roll's autoregressive memory is fully reset; no seam (the fade
+            # starts at 100% old, continuous with the already-decoded past).
+            anchor_due = (anchor_period and committed is not None and (gen_f - anchor_f) >= anchor_period)
+            if anchor_due and (avail - dec_f) >= reanchor_win and gen_f > dec_f:
+                a0 = dec_f; w1 = a0 + reanchor_win
+                cold = jit._gen(a0, a0 + self._prime_f, self.seed).tensor
+                cp = min(self._prime_f, cold.shape[1] - 1)
+                fresh = jit._gen(a0, w1, self.seed, pin=cold[:, :cp, :]).tensor
+                XO = min(gen_f - dec_f, fresh.shape[1] - 1)      # crossfade ONLY the small undecoded zone
+                fin, fout = _eq(XO, committed.device, committed.dtype)
+                ov = a0 - base_f
+                tail = committed[:, ov:ov + XO, :]
+                blended = tail * fout.view(1, -1, 1) + fresh[:, :XO, :].to(tail.dtype) * fin.view(1, -1, 1)
+                committed = torch.cat([committed[:, :ov, :], blended, fresh[:, XO:, :].to(tail.dtype)], dim=1)
+                gen_f = a0 + fresh.shape[1]; anchor_f = gen_f
+                tcut = (dec_f - base_f) // jit._TILE             # invalidate stale tiles at/after the decode frontier
+                tiles = {t: v for t, v in tiles.items() if t < tcut}
+                self.regens += 1; self.reanchors += 1
+            elif anchor_due:
+                self.anchor_skips += 1
             # wait until the handle exists and the first window's worth of source is captured
             if jit.handle is None or avail < C + H:
                 time.sleep(0.02); continue
@@ -403,9 +756,14 @@ class RealtimeCover:
                     new = jit._gen(gen_f - C, w1, self.seed, pin=committed[:, -C:, :]).tensor[:, C:, :]
                     committed = torch.cat([committed, new], dim=1); gen_f += new.shape[1]
                 self.regens += 1
-            # decode only frames with full context (headroom of generated frames after them)
+            # decode only frames with full context (headroom of generated frames after them),
+            # AND (when re-anchoring is on) hold the output a full window behind the input
+            # frontier so the re-anchor always has a whole window of source ahead for a
+            # pure-fresh reset. This trail is the ~2-bar latency cost of the drift fix; with
+            # re-anchor off there's no trail (lower latency, but the roll can warble).
             dec_limit = base_f + committed.shape[1] - headroom
-            dec_target = min(dec_f + self.SL, dec_limit)
+            dec_ceiling = (avail - reanchor_win) if anchor_period else dec_limit
+            dec_target = min(dec_f + self.SL, dec_limit, dec_ceiling)
             if dec_target <= dec_f:
                 time.sleep(0.005); continue
             # BAR-QUANTIZE: before the very first cover push, pad the output up to the next

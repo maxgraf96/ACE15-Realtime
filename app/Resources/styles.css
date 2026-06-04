@@ -177,6 +177,10 @@ body.live-mode .source { cursor: default; }
 .inmeter { height: 6px; border-radius: 3px; background: var(--hair); overflow: hidden; margin-top: 6px; }
 .inmeter-fill { height: 100%; width: 0%; background: var(--accent); transition: width .08s linear; }
 .livehint { font-size: 11px; color: var(--faint); }
+.syncrow { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 11px; color: var(--faint); }
+.syncrow label { white-space: nowrap; }
+.syncrow input[type=range] { flex: 1; accent-color: var(--accent); }
+.syncval { min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
 /* AI output stem mixer (4 groups × mute/solo). */
 .stemmix { display: flex; flex-direction: column; gap: 5px; }
 .stemmix-hd { font-size: 11px; color: var(--muted); }

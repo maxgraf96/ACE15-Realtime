@@ -96,6 +96,7 @@ class Connection:
         self._in_host_frames = 0
         self._in_since_evt = 0
         self._live_gen = False            # Phase B: route 0x04 into the live engine (feed_input)
+        self._live_rc_model = None        # model of the kept-alive live engine (None = no reusable live rc)
 
     def handle(self):
         threading.Thread(target=self._sender, daemon=True).start()
@@ -219,6 +220,7 @@ class Connection:
                     try: self.rc.close()
                     except Exception: pass
                     self.rc = None
+                self._live_rc_model = None         # file rc replaces any kept-alive live engine
                 self.playing = False
                 self._send_event({"event": "loading", "stage": "model"})   # loading weights into memory (slow, esp XL)
                 self.rc = RealtimeCover(device="mps", steps=msg.get("steps", 8),
@@ -262,15 +264,26 @@ class Connection:
                 # setters (prompt/denoise/character/metas) like file mode.
                 model = msg.get("model", "fast"); cfg = MODELS.get(model, MODELS["fast"])
                 self._ensure_models(model)
-                if self.rc is not None:
-                    try: self.rc.close()
-                    except Exception: pass
-                    self.rc = None
-                self._send_event({"event": "loading", "stage": "model"})
-                self.rc = RealtimeCover(device="mps", steps=msg.get("steps", 8),
-                                        window_s=msg.get("window", 8.0), pin_s=msg.get("pin", 3.0),
-                                        lookahead_s=msg.get("lookahead", 1.0), config_path=cfg)
+                # REUSE the kept-alive live engine if its model matches (Stop keeps it loaded ->
+                # instant replay, no model reload). Otherwise build a fresh one. begin_live()+reset()
+                # below clear the live buffer/onset/loop + ring so reuse starts from scratch.
+                reuse = (self.rc is not None and getattr(self.rc, "live", False)
+                         and self._live_rc_model == model)
+                if reuse:
+                    self.rc.reset()                  # stop the producer + clear ring/counters (keep the model)
+                else:
+                    if self.rc is not None:
+                        try: self.rc.close()
+                        except Exception: pass
+                        self.rc = None
+                    self._send_event({"event": "loading", "stage": "model"})
+                    self.rc = RealtimeCover(device="mps", steps=msg.get("steps", 8),
+                                            window_s=msg.get("window", 8.0), pin_s=msg.get("pin", 3.0),
+                                            lookahead_s=msg.get("lookahead", 2.0), config_path=cfg)
+                    self._live_rc_model = model
                 self.rc.begin_live()
+                self.rc.loop_bars_hint = float(msg.get("loop_bars", 0) or 0)   # 0 = auto-detect the loop
+                self.rc.loop_lead_s = float(msg.get("loop_lead", 0) or 0) / 1000.0   # sync offset (ms->s)
                 self.rc.jit._ensure_sep()             # pre-warm Demucs (before the producer runs) so the
                 self.rc.set_stems(msg.get("stems"))   # OUTPUT stem mixer responds instantly any time
 
@@ -287,11 +300,13 @@ class Connection:
                     threading.Thread(target=self._stats_loop, daemon=True).start()
                 self._send_event({"event": "live_started", "bpm": self.rc.jit.bpm, "key": self.rc.jit.key})
             elif cmd == "live_stop":
+                # KEEP the model loaded so the next Play is instant — just stop the producer
+                # (live_start reuses this engine when the model matches). Frees the GPU only on
+                # a model switch / file-mode switch (handled in live_start / load).
                 self._live_gen = False; self._in_active = False; self.playing = False
                 if self.rc is not None:
-                    try: self.rc.close()
+                    try: self.rc.stop()
                     except Exception: pass
-                    self.rc = None
                 self._send_event({"event": "live_stopped"})
             elif self.rc is None:
                 return   # no track loaded yet — control commands no-op (UI re-sends state on load)
@@ -333,6 +348,10 @@ class Connection:
                 self.rc.set_input_gain(float(msg["value"]))   # source trim into the model (re-encode)
             elif cmd == "stems":
                 self.rc.set_stems(msg.get("value"))   # live source separation (e.g. ["drums"])
+            elif cmd == "loop_bars":
+                self.rc.set_loop_bars(float(msg.get("value", 0) or 0))   # manual loop length (0 = auto)
+            elif cmd == "loop_lead":
+                self.rc.set_loop_lead(float(msg.get("value", 0) or 0))   # AI sync offset in ms
             elif cmd == "seek":
                 self.rc.seek(float(msg["value"]))   # value = fractional position 0..1
             elif cmd == "reconfigure":

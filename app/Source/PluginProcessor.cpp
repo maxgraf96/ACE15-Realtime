@@ -257,7 +257,7 @@ void ACE15Processor::setRealtimeInput(bool on)
 }
 
 void ACE15Processor::startRealtime(const juce::String& tags, double denoise, double character,
-                                   const juce::String& bpm, const juce::String& key)
+                                   const juce::String& bpm, const juce::String& key, double loopBars, double loopLeadMs)
 {
     auto m = makeMsg("live_start");
     auto* o = m.getDynamicObject();
@@ -265,6 +265,8 @@ void ACE15Processor::startRealtime(const juce::String& tags, double denoise, dou
     o->setProperty("tags", tags);
     o->setProperty("denoise", denoise);
     o->setProperty("character", character);
+    o->setProperty("loop_bars", loopBars > 0.0 ? loopBars : 0.0);   // 0 = auto-detect the loop
+    o->setProperty("loop_lead", loopLeadMs);   // AI sync offset (ms, signed: + earlier / − later)
     if (bpm.trim().isNotEmpty()) o->setProperty("bpm", bpm.trim());
     if (key.trim().isNotEmpty()) o->setProperty("key", key.trim());
     o->setProperty("send_bpm", sendBpm);
@@ -292,6 +294,20 @@ void ACE15Processor::setStems(const juce::var& stems)
     auto m = makeMsg("stems");
     m.getDynamicObject()->setProperty("value", stems);
     ipc.sendControl(m);                              // live: re-separate from here on
+}
+
+void ACE15Processor::setLoopBars(double bars)
+{
+    auto m = makeMsg("loop_bars");
+    m.getDynamicObject()->setProperty("value", bars > 0.0 ? bars : 0.0);   // 0 = auto-detect
+    ipc.sendControl(m);                              // live: re-lock the loop at this length
+}
+
+void ACE15Processor::setLoopLead(double ms)
+{
+    auto m = makeMsg("loop_lead");
+    m.getDynamicObject()->setProperty("value", ms);   // AI sync offset (ms, signed: + earlier / − later)
+    ipc.sendControl(m);
 }
 
 void ACE15Processor::setStyle(const juce::String& tags, double denoise, double character)

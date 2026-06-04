@@ -93,11 +93,15 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.startRealtime(args[0].toString(), (double) args[1], (double) args[2],
                                       args.size() > 3 ? args[3].toString() : juce::String(),
-                                      args.size() > 4 ? args[4].toString() : juce::String());
+                                      args.size() > 4 ? args[4].toString() : juce::String(),
+                                      args.size() > 5 ? (double) args[5] : 0.0,
+                                      args.size() > 6 ? (double) args[6] : 0.0);
               completion({});
           })
           .withNativeFunction("stopRealtime", [this](auto, auto completion) { processor.stopRealtime(); completion({}); })
           .withNativeFunction("setStems", [this](auto args, auto completion) { processor.setStems(args[0]); completion({}); })
+          .withNativeFunction("setLoopBars", [this](auto args, auto completion) { processor.setLoopBars((double) args[0]); completion({}); })
+          .withNativeFunction("setLoopLead", [this](auto args, auto completion) { processor.setLoopLead((double) args[0]); completion({}); })
           .withNativeFunction("setMetas", [this](auto args, auto completion)
           {
               processor.setMetas((bool) args[0], (bool) args[1],

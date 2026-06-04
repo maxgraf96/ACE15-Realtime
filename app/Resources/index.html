@@ -81,9 +81,18 @@
                                 <span class="metasep">·</span>
                                 <input type="text" id="live-key" class="metafield keyfield" value="C minor"
                                     title="Key of your playing — feeds the cover's Metas." />
+                                <span class="metasep">·</span>
+                                <input type="text" id="live-loopbars" class="metafield" inputmode="numeric" placeholder="auto"
+                                    title="Loop length in bars (e.g. 4). Leave as 'auto' to detect it. Setting it makes the AI lock onto your loop faster." />
+                                <span class="metaunit">bar loop</span>
                             </span>
                         </div>
                         <div class="inmeter"><div class="inmeter-fill" id="inmeter-fill"></div></div>
+                        <div class="syncrow">
+                            <label for="live-lead" title="Nudge the AI cover against the beat to cancel input+output latency. Right (+) = earlier (if it's behind); left (−) = later (if it comes in ahead). Centre = 0.">AI sync</label>
+                            <input type="range" id="live-lead" min="-500" max="500" step="5" value="0" />
+                            <span id="live-lead-val" class="syncval">0 ms</span>
+                        </div>
                         <div class="stemmix" id="stemmix">
                             <div class="stemmix-hd">AI output stems — mute / solo</div>
                             <div class="stemg"><span class="stemg-name">Drums</span>

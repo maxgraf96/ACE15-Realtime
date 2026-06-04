@@ -149,7 +149,9 @@ class JITCover:
 
     # ---- live / streaming source (Phase 3: real-time input) ----
     LIVE_CHUNK_F = 25     # latent frames appended per encode step (1.0 s; multiple of SEM_PATCH)
-    LIVE_MARGIN_F = 12    # ~0.48 s overlap each side, discarded — measured near-lossless (rel-err 6e-4)
+    LIVE_MARGIN_F = 12    # right (future) overlap discarded — bounded by how much input we can wait for
+    LIVE_LMARGIN_F = 12   # LEFT (past) context fed to the chunk encode; too small starves the VAE
+                          # receptive field -> boundary artifacts that the roll amplifies into drift
     HINT_MARGIN_F = 25    # left-context margin for incremental (frozen) hint extraction (multiple of 5)
     OUT_SEP_MARGIN_F = 20  # discard margin for OUTPUT separation (~0.8s; rolling-vs-whole corr 0.976, fits headroom)
 
@@ -186,6 +188,9 @@ class JITCover:
         real-time live input — bpm/key come from the UI (manual/host), not detection."""
         import threading as _th
         self._live = True
+        self._dbg_whole = False
+        self._onset = -1                 # sample index of the first audible input (loop hard start)
+        self.enc_lat_mode = "window"; self.enc_hint_mode = "frozen"   # seamless recent source + cheap stable hints
         self._TILE = 16   # smaller decode tiles for live -> less decode headroom -> lower latency
         self._live_lock = _th.Lock()
         self._live_raw = torch.zeros(2, 0)   # raw 48k stereo (cpu); also the A/B reference
@@ -210,55 +215,128 @@ class JITCover:
         if g != 1.0:
             x = x * g                        # input-gain trim applied as the stream arrives
         with self._live_lock:
+            start = self._live_raw.shape[1]
             self._live_raw = torch.cat([self._live_raw, x], dim=1)
             self.source_wav = self._live_raw
+            if self._onset < 0:                  # ONSET = first audible sample = the loop's hard start
+                hot = (x.abs().mean(0) > 0.03).nonzero()
+                if hot.numel() > 0:
+                    self._onset = start + int(hot[0, 0])
+
+    # Live source pipeline (two independent axes; see encode_pending). enc_lat_mode:
+    #   "chunked" = append a small overlap-discard chunk each step (cheap, O(1)) but the
+    #               seams ACCUMULATE -> the dominant cause of live drift/warble;
+    #   "whole"   = re-encode ALL raw each step (seamless, but O(n) -> too slow long-term);
+    #   "window"  = re-encode only the recent W_ENC_F frames seamlessly and splice onto the
+    #               frozen older latent (seamless where the generator reads, O(W) cost) <-
+    #               the real fix. enc_hint_mode: "frozen" = extract hints for the new region
+    #   only + freeze (cheap, stable); "whole" = re-extract all each step (O(n), slow, no
+    #   quality gain — measured). Live default = window+frozen (seamless source, real-time).
+    enc_lat_mode = "window"
+    enc_hint_mode = "frozen"
+    W_ENC_F = 224   # ~9 s recent re-encode window; the generator only reads the recent ~5 s,
+                    # so the splice seam at the window's left edge sits safely behind it
+    GEN_MARGIN_F = 12  # hold the GENERATABLE frontier this far behind the encode frontier: the
+                       # newest source frames lack future context (encoder future RF), so letting
+                       # the roll consume them bakes in instability. (chunked already excludes mf.)
 
     def encode_pending(self):
-        """Encode any newly-complete chunk of pending live audio (overlap-discard) and
-        append it to the streaming source latent + hints. Run from the PRODUCER thread
-        (MPS). Returns the number of source frames now available to generate from."""
+        """Encode any newly-available live audio and (re)build the streaming source latent
+        + hints. Run from the PRODUCER thread (MPS). Returns the number of source frames now
+        available to generate from. Source latent and hints are built independently per
+        enc_lat_mode / enc_hint_mode so the two contributors to live drift can be isolated."""
         from acestep.nodes.types import Audio, Latent
         from acestep.engine.session import PreparedSource
-        if getattr(self, "_dbg_whole", False):   # DEBUG: re-encode the WHOLE raw (seamless source)
-            with self._live_lock:
-                raw = self._live_raw
-            n = (raw.shape[1] // SPF // SEM_PATCH) * SEM_PATCH
-            if n <= self._enc_f:
-                return self._enc_f
-            lat = self.session.encode_audio(Audio(waveform=raw[:, :n * SPF], sample_rate=SR)).tensor[:, :n, :].contiguous()
-            self.source = PreparedSource(latent=Latent(tensor=lat),
-                                         context_latent=self.session.extract_hints(Latent(tensor=lat)))
-            self._enc_f = n
-            return n
-        cf, mf = self.LIVE_CHUNK_F, self.LIVE_MARGIN_F
+        whole = getattr(self, "_dbg_whole", False)   # back-compat shorthand for whole+whole
+        lat_mode = "whole" if whole else self.enc_lat_mode
+        hint_mode = "whole" if whole else self.enc_hint_mode
+        cf, mf, hm = self.LIVE_CHUNK_F, self.LIVE_MARGIN_F, self.HINT_MARGIN_F
         with self._live_lock:
             raw = self._live_raw
-        # need audio through (enc_f + cf + mf) frames to cleanly encode chunk [enc_f, enc_f+cf)
-        if raw.shape[1] < (self._enc_f + cf + mf) * SPF:
-            return self._enc_f
-        lo = max(0, self._enc_f - mf)
-        hi = self._enc_f + cf + mf
-        sub = raw[:, lo * SPF: hi * SPF]
-        lat = self.session.encode_audio(Audio(waveform=sub, sample_rate=SR)).tensor   # [1, ~(hi-lo), D]
-        take = self._enc_f - lo                          # left margin frames (0 at the very start)
-        new = lat[:, take: take + cf, :]
-        if new.shape[1] < cf:                            # encoder produced fewer frames than asked
-            return self._enc_f
-        new = new.contiguous()
-        full = new if self.source is None else torch.cat([self.source.latent.tensor, new], dim=1)
-        self._enc_f += cf
-        # STABLE hints: extract for the NEW region only (with a left-context margin) and
-        # FREEZE — append-only. Re-extracting the whole growing latent each chunk drifts the
-        # hints of already-committed frames, so the pinned rolling continuation mismatches
-        # what `committed` was generated against -> warble. File mode's hints are stable.
-        hm = self.HINT_MARGIN_F
-        old = self._enc_f - cf
-        lo = max(0, old - hm)                          # multiple of 5 (cf, hm, enc_f all multiples of 5)
-        hint = self.session.extract_hints(Latent(tensor=full[:, lo:self._enc_f, :])).tensor
-        new_ctx = hint[:, old - lo:, :].contiguous()   # hints for [old, enc_f) = the new cf frames
-        self._ctx = new_ctx if self._ctx is None else torch.cat([self._ctx, new_ctx], dim=1)
-        self.source = PreparedSource(latent=Latent(tensor=full), context_latent=Latent(tensor=self._ctx))
-        return self._enc_f
+        n_avail = (raw.shape[1] // SPF // SEM_PATCH) * SEM_PATCH   # total encodable frames (multiple of 5)
+        # ---- 1) source latent up to `target` ----
+        if lat_mode in ("whole", "window"):
+            # re-encode is seamless but costs O(window); only fire once >= cf new frames
+            # arrived (not every ~0.2 s) so the load stays ~encode(window)/cf-seconds.
+            if n_avail - self._enc_f < (cf if self._enc_f else 1):
+                return max(0, self._enc_f - self.GEN_MARGIN_F)   # safe generatable frontier (consistent)
+            target = n_avail
+            prev = None if self.source is None else self.source.latent.tensor
+            if lat_mode == "whole" or prev is None:
+                lo = 0                               # prev=None: must encode from 0 to keep absolute indexing
+            else:
+                lo = max(0, ((target - self.W_ENC_F) // SEM_PATCH) * SEM_PATCH)
+                lo = min(lo, prev.shape[1])          # never leave a gap before the re-encoded window
+            enc = self.session.encode_audio(
+                Audio(waveform=raw[:, lo * SPF: target * SPF], sample_rate=SR)).tensor[:, :target - lo, :].contiguous()
+            lat_full = enc if (lo == 0 or prev is None) else torch.cat([prev[:, :lo, :], enc], dim=1)
+        else:  # chunked overlap-discard append of [enc_f, enc_f+cf) with a LEFT-context margin
+            lm = self.LIVE_LMARGIN_F
+            if raw.shape[1] < (self._enc_f + cf + mf) * SPF:
+                return self._enc_f
+            lat_full = None if self.source is None else self.source.latent.tensor
+            cur = self._enc_f
+            while raw.shape[1] >= (cur + cf + mf) * SPF:     # chunkall drains ALL pending chunks; chunked does one
+                lo = max(0, cur - lm); hi = cur + cf + mf
+                lat = self.session.encode_audio(Audio(waveform=raw[:, lo * SPF: hi * SPF], sample_rate=SR)).tensor
+                new = lat[:, cur - lo: cur - lo + cf, :]
+                if new.shape[1] < cf:
+                    break
+                lat_full = new.contiguous() if lat_full is None else torch.cat([lat_full, new.contiguous()], dim=1)
+                cur += cf
+                if lat_mode != "chunkall":
+                    break
+            if cur == self._enc_f:
+                return self._enc_f
+            target = cur
+        # ---- 2) hints up to `target` ----
+        if hint_mode == "whole":
+            ctx_full = self.session.extract_hints(Latent(tensor=lat_full)).tensor
+        else:  # frozen: extract only the NEW region [old, target) (left-context margin) and append
+            old = self._enc_f
+            lo2 = max(0, old - hm)                    # multiple of 5
+            hint = self.session.extract_hints(Latent(tensor=lat_full[:, lo2:target, :])).tensor
+            new_ctx = hint[:, old - lo2:, :].contiguous()
+            ctx_full = new_ctx if self._ctx is None else torch.cat([self._ctx, new_ctx], dim=1)
+            self._ctx = ctx_full
+        self._enc_f = target
+        self.source = PreparedSource(latent=Latent(tensor=lat_full), context_latent=Latent(tensor=ctx_full))
+        # whole/window expose every encoded frame incl. the under-contexted frontier; hold the
+        # generatable frontier GEN_MARGIN_F behind it. chunked already committed only mf-future frames.
+        margin = self.GEN_MARGIN_F if lat_mode in ("whole", "window") else 0
+        return max(0, self._enc_f - margin)
+
+    def detect_loop(self, min_bars=1, max_bars=16, thresh=0.90):
+        """Find the loop period in the live raw buffer via normalized autocorrelation at
+        integer-bar lags (from self.bpm). The input is a non-causal model's nightmare —
+        no future context at the live edge — but if it LOOPS, the future == the loop, so we
+        can cover it like a file (clean, low-latency). Returns (period_samples, confidence,
+        bars) for the SMALLEST bar-count that self-matches above `thresh`, else (None,c,0).
+        Needs >= 2 loops captured. Run from the producer thread (reads raw, cheap CPU)."""
+        with self._live_lock:
+            raw = self._live_raw
+        n = raw.shape[1]
+        bar = 60.0 / max(1e-6, float(self.bpm)) * 4.0 * SR     # samples per bar (4/4)
+        if n < int(2 * bar):
+            return None, 0.0, 0
+        mono = raw.float().mean(0)
+        win = max(int(bar), int(2 * bar))    # compare a 2-bar window (not a whole loop) -> detect sooner
+        cands = []
+        for B in range(min_bars, max_bars + 1):
+            P = int(round(B * bar))
+            w = min(P, win)
+            if n < P + w:
+                break
+            a = mono[n - w:n]; b = mono[n - w - P:n - P]   # last w samples vs w samples one period earlier
+            denom = (a.norm() * b.norm()).item() + 1e-9
+            cands.append((B, P, (a * b).sum().item() / denom))   # cosine similarity at lag = P
+        if not cands:
+            return None, 0.0, 0
+        mx = max(c[2] for c in cands)
+        for B, P, c in cands:                                   # fundamental = smallest bar-count that matches
+            if c >= thresh and c >= mx - 0.04:
+                return P, c, B
+        return None, mx, 0
 
     def source_slice(self, f0, n_samples):
         """Original source audio for the slice starting at latent frame f0, exactly
@@ -293,8 +371,8 @@ class JITCover:
     def _refer(self):
         """Timbre reference latent for the current Character (0=style, 1=source)."""
         c = self.character
-        if c <= 0.01:
-            return None                       # full style (CLAP-tuned default)
+        if c <= 0.01 or self.source is None:
+            return None                       # full style (CLAP-tuned default), or no source yet (live)
         if c >= 0.99:
             return self.source.latent         # keep source character
         from acestep.nodes.types import Latent

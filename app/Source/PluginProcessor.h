@@ -53,9 +53,11 @@ public:
     void setRealtimeInput(bool on); // (Phase A) stream the input bus to the engine (capture only)
     // Real-time live mode: start/stop generating a live accompaniment from the input bus.
     void startRealtime(const juce::String& tags, double denoise, double character,
-                       const juce::String& bpm, const juce::String& key);
+                       const juce::String& bpm, const juce::String& key, double loopBars, double loopLeadMs);
     void stopRealtime();
     void setStems(const juce::var& stems);   // live source separation: keep only these stems (e.g. ["drums"])
+    void setLoopBars(double bars);           // manual loop length in bars (0 = auto-detect)
+    void setLoopLead(double ms);             // play the AI cover this many ms ahead (latency sync offset)
     void play();    // play / resume (keeps position)
     void pause();   // pause — keep position
     void stop();    // full stop — reset to the start

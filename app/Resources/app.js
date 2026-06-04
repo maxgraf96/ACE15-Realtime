@@ -34,6 +34,8 @@ const setInputGainFn = nf("setInputGain");
 const setMakeupFn = nf("setMakeup");
 const startRealtimeFn = nf("startRealtime");
 const stopRealtimeFn = nf("stopRealtime");
+const setLoopBarsFn = nf("setLoopBars");
+const setLoopLeadFn = nf("setLoopLead");
 const setStemsFn = nf("setStems");
 const openFile    = nf("openFile");
 
@@ -52,7 +54,7 @@ const stepsEl = $("steps"), stepsVal = $("steps-value");
 const windowEl = $("window"), evolveEl = $("evolve-toggle");
 const playBtn = $("play"), stopBtn = $("stop"), abEl = $("ab-toggle");
 const srcModeBtn = $("srcmode-toggle"), sourceLive = $("source-live");
-const inMeterFill = $("inmeter-fill"), liveBpm = $("live-bpm"), liveKey = $("live-key");
+const inMeterFill = $("inmeter-fill"), liveBpm = $("live-bpm"), liveKey = $("live-key"), liveLoopBars = $("live-loopbars"), liveLead = $("live-lead");
 const dl = $("dl"), dlFill = $("dl-fill");
 const errBanner = $("error-banner"), errText = $("error-text"), errDismiss = $("error-dismiss");
 const filePicker = $("file-picker");
@@ -234,6 +236,17 @@ keyField.addEventListener("change", pushMetas);
 const pushLiveMetas = () => { if (started()) setMetas(sendBpm, sendKey, liveBpm.value.trim(), liveKey.value.trim()); };
 liveBpm.addEventListener("change", pushLiveMetas);
 liveKey.addEventListener("change", pushLiveMetas);
+// Manual loop length (bars). 0/blank = auto-detect. Editing while live re-locks at the new length.
+const loopBarsVal = () => Math.max(0, parseInt(liveLoopBars.value, 10) || 0);
+liveLoopBars.addEventListener("change", () => { if (started()) setLoopBarsFn(loopBarsVal()); });
+// AI sync offset (ms): play the cover this far ahead to cancel round-trip latency. Live-adjustable.
+const liveLeadVal = $("live-lead-val");
+const leadVal = () => Math.max(-500, Math.min(500, parseInt(liveLead.value, 10) || 0));   // signed: +earlier / -later
+const leadTxt = (v) => (v > 0 ? "+" : "") + v + " ms";
+liveLead.addEventListener("input", () => {
+  liveLeadVal.textContent = leadTxt(leadVal());
+  if (started()) setLoopLeadFn(leadVal());
+});
 
 let model = "quality";   // default = XL (best sound)
 const modelEl = $("model-toggle");
@@ -263,7 +276,7 @@ stopBtn.addEventListener("click", () => {
 function startLive() {
   setStatus("loading model…", "accent");
   startRealtimeFn(promptEl.value, parseFloat(denoiseEl.value), parseFloat(charEl.value),
-                  liveBpm.value.trim(), liveKey.value.trim());
+                  liveBpm.value.trim(), liveKey.value.trim(), loopBarsVal(), leadVal());
   setTransport("playing");
 }
 function stopLive() {
@@ -424,6 +437,11 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       mBuf.textContent = (ev.buffered_s ?? 0).toFixed(1) + "s";
       mRegens.textContent = ev.regens ?? "–";
       mLat.textContent = (ev.worst_regen_ms ?? 0) + "ms";
+      if (liveMode && playState === "playing") {       // live status: listening → loop locked → restyling
+        if (ev.restyling) setStatus("restyling…", "accent");
+        else if (ev.loop_locked) setStatus(`loop locked · ${ev.loop_bars} bars`, "ok");
+        else setStatus("listening for loop…", "accent");
+      }
       if (!scrubbing && performance.now() > scrubHoldUntil && typeof ev.progress === "number") {
         if (playheadEl) playheadEl.style.left = (ev.progress * 100).toFixed(2) + "%";
         showPos(ev.progress);   // m:ss readout follows the playhead
