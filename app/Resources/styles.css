@@ -16,6 +16,9 @@
   --accent-tint:oklch(0.84  0.05  60 / 0.04);
   --error:      oklch(0.72  0.15  25);
   --error-dim:  oklch(0.72  0.15  25 / 0.10);
+  --link:       oklch(0.80  0.13  150);          /* Ableton Link connected (green) */
+  --link-dim:   oklch(0.80  0.13  150 / 0.5);
+  --link-tint:  oklch(0.80  0.13  150 / 0.06);
 }
 
 * { box-sizing: border-box; }
@@ -82,6 +85,24 @@ body {
 }
 .status.accent .dot { animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+/* ── Ableton Link indicator ───────────────────────────────────────────
+   Dim pill when Link is up but no peer is found; lights green and shows the
+   shared BPM when connected to Ableton (or any Link peer). */
+.link-ind {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--faint); border: 1px solid var(--hair); border-radius: 999px;
+  padding: 3px 11px; transition: color .2s, border-color .2s, background .2s;
+}
+.link-ind .link-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; opacity: 0.55;
+}
+.link-ind.connected {
+  color: var(--link); border-color: var(--link-dim); background: var(--link-tint);
+}
+.link-ind.connected .link-dot { opacity: 1; animation: pulse 1.6s ease-in-out infinite; }
 
 /* ── Error banner ─────────────────────────────────────────────────── */
 .error-banner {

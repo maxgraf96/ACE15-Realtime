@@ -282,7 +282,11 @@ class Connection:
                                             lookahead_s=msg.get("lookahead", 2.0), config_path=cfg)
                     self._live_rc_model = model
                 self.rc.begin_live()
-                self.rc.loop_bars_hint = float(msg.get("loop_bars", 0) or 0)   # 0 = auto-detect the loop
+                # DEFAULT to a 4-bar hint when the field is blank. Auto-detect (hint 0) can fail to lock
+                # on some loops and then the engine sits in the LISTENING state, which leaks memory until
+                # it OOM-crashes. A hint makes it lock in ~1 loop (the locked path is leak-free). The user
+                # overrides with the bar-loop field for non-4-bar loops.
+                self.rc.loop_bars_hint = float(msg.get("loop_bars") or 4)
                 self.rc.loop_lead_s = float(msg.get("loop_lead", 0) or 0) / 1000.0   # sync offset (ms->s)
                 self.rc.jit._ensure_sep()             # pre-warm Demucs (before the producer runs) so the
                 self.rc.set_stems(msg.get("stems"))   # OUTPUT stem mixer responds instantly any time

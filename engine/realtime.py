@@ -9,6 +9,7 @@ queued and applied on the next produced slice -> latency ~= the buffered amount
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -304,6 +305,19 @@ class RealtimeCover:
         starts weak. RESAMPLE to EXACTLY period_s so it tiles forever without drift. One-shot.
         Returns (cover_pcm [period_s,2], orig_pcm [period_s,2]) or None."""
         jit = self.jit
+        self._n_renders = getattr(self, "_n_renders", 0) + 1   # telemetry: total loop-cover renders
+        def _rlog(msg):                                        # step-by-step render memory probe (opt-in)
+            if os.environ.get("ACE15_LIVE_LOG") != "1":
+                return
+            try:
+                _m = getattr(torch, "mps", None)
+                _c = getattr(_m, "current_allocated_memory", None)
+                _d = getattr(_m, "driver_allocated_memory", None)
+                with open("/tmp/ace15_live.log", "a") as _f:
+                    _f.write(f"  RENDER[{self._n_renders}] {msg} "
+                             f"cur={(_c()/1e6 if _c else -1):.0f}MB drv={(_d()/1e6 if _d else -1):.0f}MB\n")
+            except Exception:
+                pass
         import torchaudio.functional as AF
         from acestep.nodes.types import Audio, Latent
         from acestep.engine.session import PreparedSource
@@ -311,31 +325,51 @@ class RealtimeCover:
             if start_a + period_s > jit._live_raw.shape[1]:
                 return None
             loop = jit._live_raw[:, start_a: start_a + period_s].contiguous()   # one onset-aligned loop
+        _rlog(f"START period_s={period_s} ({period_s/SR:.2f}s) bpm={jit.bpm} bpb={self.beats_per_bar} steps={jit.steps}")
         raw3 = torch.cat([loop, loop, loop], 1)                # tile x3 (the loop repeats -> seamless joins)
         lat = jit.session.encode_audio(Audio(waveform=raw3, sample_rate=SR)).tensor
         Pf = (lat.shape[1] // 3 // SEM_PATCH) * SEM_PATCH      # encoded frames per loop (multiple of 5)
+        _rlog(f"after encode raw3={tuple(raw3.shape)} lat={tuple(lat.shape)} Pf={Pf}")
         if Pf < 5:
             return None
         lat = lat[:, :3 * Pf, :].contiguous()
         ctx = jit.session.extract_hints(Latent(tensor=lat))
+        _rlog("after extract_hints")
         saved_src, saved_handle, saved_tile = jit.source, jit.handle, jit._TILE
         try:
             jit.source = PreparedSource(latent=Latent(tensor=lat), context_latent=ctx)
             jit._encode()                                      # rebuild cond w/ the latest Style AND a valid
             #            source for _refer() (Character timbre ref) — must run with jit.source set, on THIS
             #            (background) thread so it's serialized with the render's other GPU work.
+            _rlog("after _encode")
             jit.handle = jit.session.stream(source=jit.source, conditioning=jit.cond, steps=jit.steps,
                                             shift=jit.shift, pipeline_depth=1, **jit._dcw_kwargs())
             jit._TILE = 48                                      # full-quality decode for the one-shot render
-            cover, _ = jit.render(window_s=min(20.0, 3 * Pf / FPS), lookahead_s=1.0,
+            _win = min(20.0, 3 * Pf / FPS)
+            _rlog(f"before render window_s={_win:.2f}")
+            cover, _ = jit.render(window_s=_win, lookahead_s=1.0,
                                   slice_s=1.0, xfade_s=0.12, seed=seed)
+            _rlog(f"after render cover={tuple(cover.shape)}")
         finally:
+            # CLOSE the streaming handle this render created — else every render leaks its handle's
+            # MPS buffers (KV cache etc.: ~hundreds of MB on 2B, GBs on XL). Repeated locks/re-renders
+            # then climb to tens of GB -> swap -> beachball -> OOM crash. THIS was the runaway leak.
+            if jit.handle is not None and jit.handle is not saved_handle:
+                try: jit.handle.close()
+                except Exception: pass
             jit.source, jit.handle, jit._TILE = saved_src, saved_handle, saved_tile
         if jit.dcw_enabled:
             cover = cover * self._dcw_gain
         cov = cover[:, Pf * SPF: 2 * Pf * SPF].contiguous()    # the MIDDLE loop (full context, no ending/weak start)
-        if cov.shape[1] != period_s:                           # lock the loop length to the exact period
-            cov = AF.resample(cov, cov.shape[1], period_s)
+        if cov.shape[1] != period_s:                           # lock the loop length to the EXACT period.
+            # NB: do NOT use torchaudio.functional.resample here — its sinc kernel is ~orig/gcd(orig,new)
+            # taps, and (cov_len=Pf*SPF) vs (period_s from _refine_period) are large + ~coprime, so the
+            # kernel explodes to ~350k taps -> tens of GB -> the producer thread hangs -> 96 GB -> crash.
+            # (Synthetic test loops are exact multiples so gcd is huge and the kernel was ~1 tap, hiding
+            # this.) The ratio is ~1.0 (length-locking, not pitch), so kernel-free linear interpolation is
+            # sonically identical and O(n). This is the loop-cover twin of the streaming "metallic" fix.
+            cov = torch.nn.functional.interpolate(
+                cov.float().unsqueeze(0), size=int(period_s), mode="linear", align_corners=False).squeeze(0)
         cov = cov[:, :period_s]
         if cov.shape[1] < period_s:                            # pad a hair if resample rounded short
             cov = torch.cat([cov, cov[:, :period_s - cov.shape[1]]], 1)
@@ -500,6 +534,7 @@ class RealtimeCover:
         # input sample), so it's deterministic + stable — no cross-correlation, no re-align jitter.
         loop_cov = None; loop_full = None; loop_org = None; loop_P = 0   # loop_full = full mix; loop_cov = stem-mixed
         last_detect = -10 ** 9
+        last_lock_try = -10 ** 9                 # wall-clock of the last lock ATTEMPT (rate limit, see below)
         detect_every = int(bar_s * SR)          # re-check for a loop ~once per bar
         give_up = not self.loop_enable          # no loop found in time -> continuous fallback
         cont_started = False                    # one-time start-point reset when continuous takes over
@@ -562,20 +597,47 @@ class RealtimeCover:
             threading.Thread(target=work, daemon=True).start()
 
         def _loop_loud(period_s):
-            """Is the WHOLE recent loop (period_s) loud — every bar above the floor? Guards the
-            lock against silence AND partial silence (audio that only just started), so the
-            captured loop is fully populated -> a clean, non-silent cover from the first lock."""
+            """Is the recent loop (period_s) loud overall? Guards the lock against silence / not-yet-
+            started audio. Uses the WHOLE-window RMS (not per-bar) so a quiet bar within a real loop
+            doesn't block the lock forever — sitting unlocked leaks memory until it OOM-crashes."""
             bs = bar_frames * SPF
             n = min(jit._live_raw.shape[1], max(period_s, bs))
             if n < bs:
                 return False
             with jit._live_lock:
                 seg = jit._live_raw[:, -n:].float()
-            for i in range(n // bs):                              # every bar must have signal
-                if float(seg[:, i * bs:(i + 1) * bs].pow(2).mean().sqrt()) < 1.5e-3:   # ~ -56 dB
-                    return False
-            return True
+            return float(seg.pow(2).mean().sqrt()) > 1.5e-3       # ~ -56 dB overall
+        _mps_empty = getattr(getattr(torch, "mps", None), "empty_cache", None)   # release cached MPS blocks
+        _last_gc = time.time()
         while self._running:
+            # Periodically release the MPS allocator cache. Live generation (esp. the continuous
+            # fallback) allocates large transient tensors every tick; MPS caches the freed blocks and
+            # the footprint climbs UNBOUNDED (observed ~25 MB/s on 2B, GB/s on XL -> 80+ GB -> the OS
+            # swaps -> beachball -> OOM crash). empty_cache() every ~2 s caps it. Cheap relative to a
+            # model step; the ~2 s cadence keeps any latency blip well under the buffer.
+            if _mps_empty is not None and time.time() - _last_gc > 2.0:
+                _last_gc = time.time()
+                try: _mps_empty()
+                except Exception: pass
+                # lightweight live-mode telemetry (one line / 2 s; negligible). Reveals whether the
+                # engine actually LOCKS and whether mps_cur is flat — set ACE15_LIVE_LOG=0 to silence.
+                if os.environ.get("ACE15_LIVE_LOG") == "1":      # opt-in live-mode diagnostics
+                    try:
+                        _mps = getattr(torch, "mps", None)
+                        _cf = getattr(_mps, "current_allocated_memory", None)
+                        _df = getattr(_mps, "driver_allocated_memory", None)
+                        _cur = (_cf() / 1e6) if _cf else -1
+                        _drv = (_df() / 1e6) if _df else -1
+                        import resource
+                        _rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6   # bytes on macOS -> MB
+                        with open("/tmp/ace15_live.log", "a") as _lf:
+                            _lf.write(f"mps_cur={_cur:.0f}MB mps_drv={_drv:.0f}MB rss={_rss:.0f}MB "
+                                      f"locked={self.loop_locked} onset={self.jit._onset} "
+                                      f"cond={'Y' if self.jit.cond is not None else 'N'} "
+                                      f"renders={getattr(self, '_n_renders', 0)} "
+                                      f"bars_hint={self.loop_bars_hint} raw_s={self.jit._live_raw.shape[1]/SR:.1f}\n")
+                    except Exception:
+                        pass
             with self._lock:
                 ctrls = list(self._ctrl); self._ctrl.clear()
                 ahead = self._produced_f - self._consumed_f
@@ -625,22 +687,16 @@ class RealtimeCover:
                 # kick off the bg re-separation on a stem change (re-uses the SAME cover; no re-gen)
                 if self._restem:
                     _spawn_restem(loop_full)
-                # re-render trigger: Style change, manual loop-bars change (both set restyled), or a
-                # detected loop-length change. Runs in the BACKGROUND; old cover keeps streaming.
+                # re-render ONLY on an explicit Style / loop-bars change. The old auto-detect re-render
+                # (detect_loop every bar -> re-render when the period drifted >4%) fired SPURIOUSLY on
+                # any noisy/varying input, and each re-render retains ~300 MB (GBs on XL) -> unbounded
+                # growth -> OOM crash. A locked loop now stays locked; if you change the loop, re-lock
+                # with Stop/Play. Runs in the BACKGROUND; the old cover keeps streaming meanwhile.
                 redo = restyled
-                if (not redo and not self._rendering and self.loop_bars_hint <= 0
-                        and fed_s - last_detect >= detect_every):
-                    last_detect = fed_s                                    # auto: re-render if the loop LENGTH changed
-                    Pc, _, _ = jit.detect_loop(thresh=self.loop_min_conf)
-                    redo = bool(Pc) and abs(Pc - loop_P) > int(0.04 * loop_P)
                 if redo or (self._restyle_pending and not self._rendering):
                     if not redo:
                         self._restyle_pending = False                     # consume the queued change
-                    if redo and not restyled and self.loop_bars_hint <= 0:   # auto loop-LENGTH change -> re-measure
-                        Pd, _, Bd = jit.detect_loop(thresh=self.loop_min_conf)
-                        Pn, Bn = (self._refine_period(Pd), Bd) if Pd else (loop_P, self.loop_bars)
-                    else:                                                 # Style/queued: SAME loop, reuse precise P
-                        Pn, Bn = loop_P, self.loop_bars
+                    Pn, Bn = loop_P, self.loop_bars                        # SAME loop, reuse the locked period
                     if onset >= 0 and (jit._live_raw.shape[1] - onset) >= Pn:
                         _spawn_rerender(_aligned_start(onset, Pn), Pn, Bn)
                 # stream PHASE-LOCKED TO THE ONSET: cover frame i == onset-phase i, so the cover for
@@ -663,32 +719,61 @@ class RealtimeCover:
                 locked = None; onset = jit._onset
                 # Anchor to the ONSET (loop hard start). Lock once >= 2 onset-aligned loops are
                 # captured AND loud (clean, onset-aligned cover; never onto silence/partial silence).
-                if onset >= 0 and jit.cond is not None:
-                    if self.loop_bars_hint > 0:                 # known length -> lock after ~1.3 loops
-                        Bn = int(round(self.loop_bars_hint)); P0 = _exact_period(Bn)
-                        if P0 > 0 and (fed_s - onset) >= (P0 * 4) // 3 and _loop_loud(P0):
-                            P = self._refine_period(P0)         # MEASURE the true period (no drift)
-                            locked = _lock_loop(_aligned_start(onset, P), P, Bn)
-                    elif fed_s - last_detect >= detect_every:   # auto: detect_loop already needs ~2 loops
-                        last_detect = fed_s
-                        Pd, cd, Bd = jit.detect_loop(thresh=self.loop_min_conf)
-                        if Pd and (fed_s - onset) >= (Pd * 4) // 3 and _loop_loud(Pd):
-                            P = self._refine_period(Pd)
-                            locked = _lock_loop(_aligned_start(onset, P), P, Bd)
+                #
+                # RATE-LIMIT the lock ATTEMPT. A normal input locks on the FIRST attempt (then loop_cov
+                # is set and we never re-enter this branch), so this never delays a good lock. It only
+                # bounds the COST when a render keeps FAILING on some input: without it the bars-hint
+                # path rendered EVERY tick (20-40x/s), each render retaining MPS (GBs on XL) -> 60+ GB
+                # in seconds -> beachball -> OOM (this is the user's "stuck listening + memory blows up"
+                # symptom). With the gate a failing lock retries at most ~once/bar and the transient is
+                # reclaimed by empty_cache(). The try/except keeps a throwing render from killing the
+                # producer thread (which would silently stop all audio).
+                # The gate only blocks the expensive RENDER (_lock_loop); the cheap condition checks run
+                # every tick, and `last_lock_try` is consumed only when we actually fire a render — so a
+                # good input still locks the instant it's ready (no added latency).
+                now = time.time()
+                gate_ok = (now - last_lock_try) >= max(1.0, bar_s)
+                if onset >= 0 and jit.cond is not None and gate_ok:
+                    try:
+                        if self.loop_bars_hint > 0:                 # known length -> lock after ~1.3 loops
+                            Bn = int(round(self.loop_bars_hint)); P0 = _exact_period(Bn)
+                            if P0 > 0 and (fed_s - onset) >= (P0 * 4) // 3 and _loop_loud(P0):
+                                last_lock_try = now                 # consumed only on a real render attempt
+                                P = self._refine_period(P0)         # MEASURE the true period (no drift)
+                                locked = _lock_loop(_aligned_start(onset, P), P, Bn)
+                        elif fed_s - last_detect >= detect_every:   # auto: detect_loop already needs ~2 loops
+                            last_detect = fed_s
+                            Pd, cd, Bd = jit.detect_loop(thresh=self.loop_min_conf)
+                            if Pd and (fed_s - onset) >= (Pd * 4) // 3 and _loop_loud(Pd):
+                                last_lock_try = now
+                                P = self._refine_period(Pd)
+                                locked = _lock_loop(_aligned_start(onset, P), P, Bd)
+                    except Exception as _e:
+                        import traceback
+                        try:
+                            with open("/tmp/ace15_live.log", "a") as _lf:
+                                _lf.write(f"LOCK FAIL: {_e}\n{traceback.format_exc()}\n")
+                        except Exception:
+                            pass
+                        if _mps_empty is not None:
+                            try: _mps_empty()             # reclaim the failed render's transient at once
+                            except Exception: pass
                 if locked:
                     loop_full, loop_org, loop_P = locked       # full mix
                     loop_cov = self._apply_stems(loop_full)    # apply the current stem mute/solo
                     self.loop_locked = True
                     continue
-                # keep the AI channel SILENT while listening (a manual hint always waits for its lock)
-                if self.loop_bars_hint > 0 or fed_s < int(self.loop_listen_s * SR):
-                    if ahead < max(self.lookahead_samp, int(1.0 * SR)):
-                        z = np.zeros((self.SL * SPF, 2), dtype=np.float32)
-                        self._push_np(z, z)
-                    else:
-                        time.sleep(0.005)
-                    continue
-                give_up = True                       # no loop in time -> continuous fallback
+                # NOT locked: stay SILENT (listening) and keep trying to lock — we NEVER fall into the
+                # old continuous-generation fallback. That fallback ran the model every tick and its
+                # committed/source latent grew UNBOUNDED (held refs, not cache: ~25 MB/s on 2B, GB/s on
+                # XL -> 80+ GB -> the OS swaps -> beachball -> OOM crash) and it warbled. Staying silent
+                # until a loop locks is bounded + safe; set the bar-loop field for a fast, reliable lock.
+                if ahead < max(self.lookahead_samp, int(1.0 * SR)):
+                    z = np.zeros((self.SL * SPF, 2), dtype=np.float32)
+                    self._push_np(z, z)
+                else:
+                    time.sleep(0.005)
+                continue
             # ===== CONTINUOUS MODE (non-looped input): rolling-encode + window+re-anchor cover =====
             avail = jit.encode_pending()            # rolling-encode new live input (MPS, this thread)
             if avail > self.full_T: self.full_T = avail

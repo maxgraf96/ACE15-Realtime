@@ -74,7 +74,8 @@ uv pip install --python .venv/bin/python torch torchaudio torchvision \
   "transformers>=4.51,<4.58" diffusers accelerate safetensors huggingface_hub \
   einops scipy soundfile numpy loguru toml vector-quantize-pytorch torchao \
   soxr laion-clap \          # soxr: key detection · laion-clap: dev style metric (optional)
-  pytorch_wavelets PyWavelets  # DCW wavelet-domain correction (optional; toggle is off without it)
+  pytorch_wavelets PyWavelets \  # DCW wavelet-domain correction (optional; toggle is off without it)
+  aalink                       # Ableton Link sync for live mode (optional; falls back to onset-anchoring)
 
 # 2. Build the app (JUCE 8 fetched at configure; first build ~minutes)
 cmake -S app -B app/build -DCMAKE_BUILD_TYPE=Release && cmake --build app/build -j8

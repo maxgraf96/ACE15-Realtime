@@ -220,8 +220,16 @@ void ACE15Processor::setModel(const juce::String& mdl)
 {
     if (mdl == selectedModel) return;
     selectedModel = mdl;
-    if (lastLoad.isObject())   // reload the current track with the new model
+    // File mode: reload the current track on the new model. Live mode: there is no file — the new
+    // model is picked up by the next live_start (the JS restarts live if it's playing), so do NOT
+    // reload (that would replace the live engine with a file load).
+    if (!inLiveMode && lastLoad.isObject())
         sendLoad(lastLoad);
+}
+
+void ACE15Processor::setLiveMode(bool on)
+{
+    inLiveMode = on;
 }
 
 void ACE15Processor::setInputGain(double db)

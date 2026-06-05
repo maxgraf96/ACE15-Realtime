@@ -313,13 +313,17 @@ class JITCover:
         can cover it like a file (clean, low-latency). Returns (period_samples, confidence,
         bars) for the SMALLEST bar-count that self-matches above `thresh`, else (None,c,0).
         Needs >= 2 loops captured. Run from the producer thread (reads raw, cheap CPU)."""
-        with self._live_lock:
-            raw = self._live_raw
-        n = raw.shape[1]
         bar = 60.0 / max(1e-6, float(self.bpm)) * 4.0 * SR     # samples per bar (4/4)
-        if n < int(2 * bar):
-            return None, 0.0, 0
-        mono = raw.float().mean(0)
+        need = int((max_bars + 2) * bar)     # only the RECENT window matters (largest lag P + window w);
+        #     copying the whole (ever-growing) buffer here every call fragments the heap against
+        #     feed_live's growing cat -> ~25 MB/s RSS creep while listening. A fixed-size slice avoids it.
+        with self._live_lock:
+            n_total = self._live_raw.shape[1]
+            if n_total < int(2 * bar):
+                return None, 0.0, 0
+            seg = self._live_raw[:, max(0, n_total - need):].clone()   # bounded copy under the lock
+        mono = seg.float().mean(0)
+        n = mono.shape[1]                    # index relative to the slice (the recent window)
         win = max(int(bar), int(2 * bar))    # compare a 2-bar window (not a whole loop) -> detect sooner
         cands = []
         for B in range(min_bars, max_bars + 1):

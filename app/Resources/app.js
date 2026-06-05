@@ -25,6 +25,7 @@ const setDcw      = nf("setDcw");
 const seekFn      = nf("seek");
 const reconfigure = nf("reconfigure");
 const setModel    = nf("setModel");
+const setLiveModeFn = nf("setLiveMode");
 const setMetas    = nf("setMetas");
 const play        = nf("play");
 const pauseFn     = nf("pause");
@@ -55,12 +56,14 @@ const windowEl = $("window"), evolveEl = $("evolve-toggle");
 const playBtn = $("play"), stopBtn = $("stop"), abEl = $("ab-toggle");
 const srcModeBtn = $("srcmode-toggle"), sourceLive = $("source-live");
 const inMeterFill = $("inmeter-fill"), liveBpm = $("live-bpm"), liveKey = $("live-key"), liveLoopBars = $("live-loopbars"), liveLead = $("live-lead");
+const linkInd = $("link-ind"), linkText = $("link-text");
 const dl = $("dl"), dlFill = $("dl-fill");
 const errBanner = $("error-banner"), errText = $("error-text"), errDismiss = $("error-dismiss");
 const filePicker = $("file-picker");
 
 let loaded = false, styled = false, evolve = false, liveMode = false, bypass = false;
 let playState = "stopped";   // "stopped" | "playing" | "paused"
+let linkConnected = false;   // Ableton Link peer present -> Link owns tempo/grid
 const started = () => playState !== "stopped";   // producer running (play OR pause) -> use live setters
 let playheadEl = null;
 let trackDur = 0;   // seconds, for the m:ss position readout
@@ -254,10 +257,18 @@ modelEl.addEventListener("click", () => {
   model = model === "fast" ? "quality" : "fast";
   modelEl.textContent = model === "quality" ? "Quality" : "Fast";
   modelEl.classList.toggle("one-shot", model === "quality");
+  setModel(model);   // updates the engine's selected model (File mode also reloads the current track)
+  const loadingTxt = model === "quality" ? "loading Quality (XL)…" : "loading Fast (2B)…";
+  if (liveMode) {
+    // Live: the model is applied by live_start. Restart now if playing (re-locks the loop on the
+    // new model); otherwise it takes effect on the next Play.
+    if (playState === "playing") { stopLive(); startLive(); setStatus(loadingTxt, "accent"); }
+    else setStatus(`${model === "quality" ? "Quality (XL)" : "Fast (2B)"} ready — press Play`, "accent");
+    return;
+  }
   styled = false; refresh();
   if (loaded) { showLoading(srcName.textContent || "track"); setStage("loading model…"); }  // reload = same wait as a drop
-  setStatus(model === "quality" ? "loading Quality (XL)…" : "loading Fast (2B)…", "accent");
-  setModel(model);   // C++ reloads the current track on the new model (downloads XL on first use)
+  setStatus(loadingTxt, "accent");
 });
 
 // Transport. FILE mode: Play/Pause (pause keeps position) + Stop (reset). LIVE mode:
@@ -294,7 +305,7 @@ function setSourceMode(live) {
   srcModeBtn.classList.toggle("ab-on", live);
   bypass = false; abEl.textContent = "Cover"; abEl.classList.remove("ab-on");
   stepsEl.disabled = live; windowEl.disabled = live;   // live window is bar-derived
-  modelEl.disabled = live;   // pick the model in File mode before going Live (avoids a mid-live file reload)
+  setLiveModeFn(live);   // tell the engine the mode so model changes skip the file reload while Live
   refresh();
   setStatus(live ? "live mode — press Play" : (loaded ? "ready — press Play" : "drop a track to begin"));
 }
@@ -379,6 +390,26 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// ── Ableton Link indicator ───────────────────────────────────────────
+// Dim "Link" when up but no peer; green "Link · N BPM" when connected to Ableton.
+// When connected, Link owns the tempo: auto-fill + lock the live BPM field.
+function updateLink(ev) {
+  if (!ev || !ev.available) { linkInd.hidden = true; linkConnected = false; return; }
+  linkInd.hidden = false;
+  linkConnected = !!ev.connected;
+  linkInd.classList.toggle("connected", linkConnected);
+  if (linkConnected) {
+    const bpm = Math.round(ev.tempo || 0);
+    linkText.textContent = `Link · ${bpm} BPM`;
+    liveBpm.value = String(bpm);     // Link tempo is ground truth
+    liveBpm.disabled = true; liveBpm.title = "Tempo from Ableton Link (locked while connected).";
+  } else {
+    linkText.textContent = "Link";
+    liveBpm.disabled = false;
+    liveBpm.title = "Tempo of your playing — sets the bar grid the AI locks to (and the cover's Metas). In a DAW this comes from the host.";
+  }
+}
+
 // ── engine events ────────────────────────────────────────────────────
 window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
   if (!ev || typeof ev !== "object") return;
@@ -428,6 +459,9 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       setTransport("stopped"); setStatus("live mode — press Play");
       inMeterFill.style.width = "0%";
       break;
+    case "link":                // Ableton Link status (~2 Hz, on change)
+      updateLink(ev);
+      break;
     case "input_level": {       // live input meter (sqrt for low-level visibility)
       const w = Math.min(100, Math.sqrt(Math.max(0, ev.peak || 0)) * 100);
       inMeterFill.style.width = w.toFixed(0) + "%";
@@ -439,7 +473,7 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
       mLat.textContent = (ev.worst_regen_ms ?? 0) + "ms";
       if (liveMode && playState === "playing") {       // live status: listening → loop locked → restyling
         if (ev.restyling) setStatus("restyling…", "accent");
-        else if (ev.loop_locked) setStatus(`loop locked · ${ev.loop_bars} bars`, "ok");
+        else if (ev.loop_locked) setStatus(`${ev.link_active ? "on Link grid" : "loop locked"} · ${ev.loop_bars} bars`, "ok");
         else setStatus("listening for loop…", "accent");
       }
       if (!scrubbing && performance.now() > scrubHoldUntil && typeof ev.progress === "number") {

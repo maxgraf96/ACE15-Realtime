@@ -77,6 +77,10 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.setModel(args[0].toString()); completion({});
           })
+          .withNativeFunction("setLiveMode", [this](auto args, auto completion)
+          {
+              processor.setLiveMode((bool) args[0]); completion({});
+          })
           .withNativeFunction("setInputGain", [this](auto args, auto completion)
           {
               processor.setInputGain((double) args[0]); completion({});

@@ -47,7 +47,8 @@ public:
     void setDcw(bool on);   // wavelet-domain per-step correction (DCW) on/off
     void seek(double fraction);   // jump playback to a fractional position (0..1)
     void reconfigure(int steps, double window);
-    void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track
+    void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track (File mode only)
+    void setLiveMode(bool on);              // File<->Live source mode: in Live, model changes skip the file reload
     void setInputGain(double db);   // trim feeding the model (<=0 dB); re-encodes the source
     void setMakeup(double db);      // make-up gain right before audio-out (-20..+20 dB)
     void setRealtimeInput(bool on); // (Phase A) stream the input bus to the engine (capture only)
@@ -81,6 +82,7 @@ private:
     juce::var liveStems;                        // selected live stems (array; empty = full mix)
     bool dcwEnabled { false };              // DCW correction; off by default (runs hot in our regime)
     juce::var lastLoad;                      // last load message, for model-change reload
+    bool inLiveMode { false };               // true while the UI is in Live source mode (suppresses file reload)
 
     double hostSampleRate = 48000.0;
     // 48k -> host-SR resampling (only when the device isn't 48k). A persistent
