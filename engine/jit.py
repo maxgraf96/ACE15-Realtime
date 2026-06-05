@@ -74,6 +74,7 @@ class JITCover:
                                use_flash_attention=False, vae_window=0.0, config_path=config_path)
         self.device = device
         self.stems = None      # OUTPUT stem mixer: stems to KEEP in the cover output (e.g. ['drums']); None/all = full mix
+        self.sep_bypass = False  # global bypass: skip Demucs entirely, always output the raw full mix (A/B audio quality)
         self._sep = None       # lazy StemSeparator
         self.steps = steps; self.shift = shift
         self.source = None; self.cond = None; self.handle = None
@@ -173,7 +174,7 @@ class JITCover:
         full = self._ensure_tiles(lat, cache, a, b)
         from .separation import STEMS
         st = self.stems
-        if not st or set(st) >= set(STEMS):          # full mix -> no separation
+        if self.sep_bypass or not st or set(st) >= set(STEMS):   # bypass / full mix -> no separation
             return full
         m = self.OUT_SEP_MARGIN_F
         Wl = lat.tensor.shape[1]

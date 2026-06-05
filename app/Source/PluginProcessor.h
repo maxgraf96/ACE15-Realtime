@@ -45,6 +45,7 @@ public:
     void setMetas(bool sendBpm, bool sendKey, const juce::String& bpm, const juce::String& key);   // tempo/key flags + (edited) values
     void setEvolve(bool on);
     void setDcw(bool on);   // wavelet-domain per-step correction (DCW) on/off
+    void setSepBypass(bool on);   // skip Demucs stem separation, output the raw full mix (A/B audio quality)
     void seek(double fraction);   // jump playback to a fractional position (0..1)
     void reconfigure(int steps, double window);
     void setModel(const juce::String& m);   // "fast"(2B) / "quality"(XL); reloads current track (File mode only)

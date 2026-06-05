@@ -387,6 +387,13 @@ void ACE15Processor::setDcw(bool on)
     ipc.sendControl(m);
 }
 
+void ACE15Processor::setSepBypass(bool on)
+{
+    auto m = makeMsg("sep_bypass");   // skip Demucs, output the raw full mix (A/B audio quality)
+    m.getDynamicObject()->setProperty("value", on);
+    ipc.sendControl(m);
+}
+
 void ACE15Processor::seek(double fraction)
 {
     auto m = makeMsg("seek");

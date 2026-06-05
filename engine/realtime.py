@@ -92,6 +92,7 @@ class RealtimeCover:
         self.link = None
         self.link_active = False       # telemetry: currently placing the cover on the Link grid
         self._link_anchor = None       # (link_beat0, cover_phase0, loop_P, loop_bars) alignment snapshot
+        self.evolve_every_loops = 2    # Evolve mode (jit.evolve): re-render a fresh variation every N loops
         self._bar_trail_s = 0.0        # achieved output trailing (whole bars) in live mode
         self._running = False
         self._done = False
@@ -155,6 +156,16 @@ class RealtimeCover:
             self.jit.set_stems(stems)
             if stems:
                 self.jit._ensure_sep()   # pre-load Demucs now (producer not running) — avoid a mid-stream stall
+
+    def set_sep_bypass(self, on):
+        """Global stem-separation bypass: skip Demucs entirely and output the RAW full mix, regardless
+        of the M/S selection. For A/B-ing whether separation affects audio quality. Queued so the
+        producer refreshes the locked cover (via _restem) to the bypassed/un-bypassed output."""
+        if self._running:
+            with self._lock:
+                self._ctrl.append(("sep_bypass", bool(on)))
+        else:
+            self.jit.sep_bypass = bool(on)
 
     def seek(self, fraction):
         """Jump playback to a fractional position (0..1) of the track. Queued so the
@@ -277,6 +288,8 @@ class RealtimeCover:
         loop boundary keeps full context -> seamless. Cheap (~RTF 0.01); MPS, so the caller runs it
         only when no background render is in flight (avoid concurrent GPU use)."""
         from .separation import STEMS
+        if self.jit.sep_bypass:
+            return full_np                       # global bypass: raw full mix, never touch Demucs
         st = self.jit.stems
         if not st or set(st) >= set(STEMS):
             return full_np
@@ -571,6 +584,8 @@ class RealtimeCover:
         # loop-cover state. Phase is anchored to jit._onset (the loop's hard start = first audible
         # input sample), so it's deterministic + stable — no cross-correlation, no re-align jitter.
         loop_cov = None; loop_full = None; loop_org = None; loop_P = 0   # loop_full = full mix; loop_cov = stem-mixed
+        prev_ph = -1                             # last pushed cover phase (detect loop-boundary crossings)
+        evolve_mark = -1                         # loop index of the last Evolve variation (-1 = uninitialised)
         last_detect = -10 ** 9
         last_lock_try = -10 ** 9                 # wall-clock of the last lock ATTEMPT (rate limit, see below)
         detect_every = int(bar_s * SR)          # re-check for a loop ~once per bar
@@ -595,18 +610,23 @@ class RealtimeCover:
             self.loop_bars = B
             return res[0], res[1], P
 
-        def _spawn_rerender(start_a, P, B):
-            """Re-render the (onset-aligned) loop cover in a BACKGROUND thread (Style/loop change)
-            while the producer keeps streaming the OLD cover -> no audio dropout, just a 'restyling'
-            status. Safe: in loop mode the producer does no MPS, so the render owns the GPU."""
+        def _spawn_rerender(start_a, P, B, announce=True):
+            """Re-render the (onset-aligned) loop cover in a BACKGROUND thread (Style/loop change, or an
+            Evolve variation) while the producer keeps streaming the OLD cover -> no audio dropout. In
+            Evolve mode the seed is offset by jit._regen so each render is a NEW improvisation of the same
+            loop/style. `announce` drives the 'restyling' UI flag (off for auto-evolve so it doesn't
+            flicker). Safe: in loop mode the producer does no MPS, so the render owns the GPU."""
             if self._rendering:
                 self._restyle_pending = True       # coalesce: render again once this one finishes
                 return
-            self._rendering = True; self.restyling = True
+            self._rendering = True
+            if announce:
+                self.restyling = True
+            seed = self.seed + (jit._regen if jit.evolve else 0)   # Evolve: browse a new variation
             def work():
                 torch.set_grad_enabled(False)          # grad flag is THREAD-LOCAL; disable in this worker
                 try:
-                    res = self._render_loop_cover(start_a, P, self.seed)   # re-encodes (Style) internally
+                    res = self._render_loop_cover(start_a, P, seed)   # re-encodes (Style) internally
                     if res:
                         cov = self._apply_stems(res[0])      # apply current stems in the BG (no main stall)
                         self._pending_cover = (res[0], cov, res[1], P, B)
@@ -698,6 +718,7 @@ class RealtimeCover:
                 elif kind == "dcw":       jit.set_dcw(enabled=val); restyled = True
                 elif kind == "input_gain": jit.input_gain_db = float(val)   # live: applied on feed, no re-encode
                 elif kind == "stems":     jit.set_stems(val); self._restem = True   # re-separate the locked cover
+                elif kind == "sep_bypass": jit.sep_bypass = bool(val); self._restem = True   # refresh cover (raw/sep)
                 elif kind == "loop_bars": self.loop_bars_hint = max(0.0, float(val)); restyled = True
                 elif kind == "loop_lead": self.loop_lead_s = float(val) / 1000.0   # ms -> s, signed (no re-render);
                 #                          +ms = play the cover EARLIER (cancel round-trip lag), -ms = LATER
@@ -708,12 +729,6 @@ class RealtimeCover:
             # Re-render (brief stall, ring covers it) on a Style change or a loop change. =====
             if self.loop_enable and loop_cov is not None:
                 onset = jit._onset
-                # swap in a finished background re-render (glitch-free: old cover streamed until now).
-                # full mix + stem-applied cover were both computed in the bg -> no producer-thread Demucs.
-                if self._pending_cover is not None:
-                    full, cov, org, P, B = self._pending_cover; self._pending_cover = None
-                    loop_full, loop_cov, loop_org, loop_P, self.loop_bars = full, cov, org, P, B
-                    self.restyling = False
                 # stem mute/solo: when the BACKGROUND re-separation finishes, swap it in and DROP the
                 # buffered old-stem audio so the toggle is heard near-instantly (phase stays aligned).
                 if self._pending_stems is not None:
@@ -721,15 +736,13 @@ class RealtimeCover:
                     with self._lock:
                         self._ring.clear(); self._ring_frames = 0
                         self._produced_f = self._consumed_f                # ahead->0, ring empty (phase: rd=0)
-                    ahead = 0                        # refill with the new stems THIS iteration (no gap)
+                    ahead = 0; prev_ph = -1          # refill with the new stems THIS iteration (no gap)
                 # kick off the bg re-separation on a stem change (re-uses the SAME cover; no re-gen)
                 if self._restem:
                     _spawn_restem(loop_full)
-                # re-render ONLY on an explicit Style / loop-bars change. The old auto-detect re-render
-                # (detect_loop every bar -> re-render when the period drifted >4%) fired SPURIOUSLY on
-                # any noisy/varying input, and each re-render retains ~300 MB (GBs on XL) -> unbounded
-                # growth -> OOM crash. A locked loop now stays locked; if you change the loop, re-lock
-                # with Stop/Play. Runs in the BACKGROUND; the old cover keeps streaming meanwhile.
+                # re-render on an explicit Style / loop-bars change. (The old auto-detect-every-bar
+                # re-render fired spuriously and leaked -> removed.) Runs in the BACKGROUND; the old
+                # cover keeps streaming and the new one is swapped in at the next loop boundary below.
                 redo = restyled
                 if redo or (self._restyle_pending and not self._rendering):
                     if not redo:
@@ -737,18 +750,36 @@ class RealtimeCover:
                     Pn, Bn = loop_P, self.loop_bars                        # SAME loop, reuse the locked period
                     if onset >= 0 and (jit._live_raw.shape[1] - onset) >= Pn:
                         _spawn_rerender(_aligned_start(onset, Pn), Pn, Bn)
+                # AUTO-EVOLVE (Evolve mode): a repeating input would give a STATIC cover. Every
+                # `evolve_every_loops` loops, render a NEW variation (fresh seed via jit._regen, same
+                # style/key/tempo) and swap it in at the next boundary -> the accompaniment DEVELOPS while
+                # staying perfectly on the grid. Skipped while a render is in flight (self-paces).
+                elif jit.evolve and not self._rendering and onset >= 0 and loop_P > 0:
+                    cur_loop = (fed_s - onset) // loop_P
+                    if evolve_mark < 0:
+                        evolve_mark = cur_loop
+                    elif cur_loop - evolve_mark >= self.evolve_every_loops \
+                            and (jit._live_raw.shape[1] - onset) >= loop_P:
+                        evolve_mark = cur_loop
+                        jit._regen += 1                                   # advance to the next variation
+                        _spawn_rerender(_aligned_start(onset, loop_P), loop_P, self.loop_bars, announce=False)
                 # stream PHASE-LOCKED. Default: anchor to the input ONSET (cover frame i == onset-phase i).
-                # When Ableton Link has a peer, anchor to LINK'S BEAT GRID instead: snapshot the current
-                # (input) cover phase against the current Link beat once, then advance phase purely from
-                # Link's beat -> the cover rides the DAW's shared clock with no input-vs-DAW drift. Both
-                # compensate the ring (rd) + round-trip latency (lead) by looking ahead to the PLAY moment.
+                # With an Ableton Link peer, anchor to LINK'S BEAT GRID (the shared DAW clock) -> no drift.
+                # `_cover_phase` looks ahead by ring+lead to the PLAY moment; a wrap (ph < prev_ph) marks a
+                # loop boundary, where we land any finished re-render so a variation/restyle starts clean.
                 tgt = int(2.0 * SR); lead = int(self.loop_lead_s * SR)
                 if ahead < tgt + self.SL * SPF:
                     with self._lock:
                         rd = self._ring_frames
                     ph = self._cover_phase(fed_s, onset, loop_P, rd + lead)
+                    if self._pending_cover is not None and (prev_ph < 0 or ph < prev_ph):
+                        full, cov, org, P, B = self._pending_cover; self._pending_cover = None
+                        loop_full, loop_cov, loop_org, loop_P, self.loop_bars = full, cov, org, P, B
+                        self.restyling = False
+                        ph = self._cover_phase(fed_s, onset, loop_P, rd + lead)   # period unchanged; recompute defensively
                     n = min(self.SL * SPF, loop_P - ph)
                     self._push_np(loop_cov[ph:ph + n], loop_org[ph:ph + n])
+                    prev_ph = ph
                 else:
                     time.sleep(0.003)
                 continue
@@ -803,6 +834,7 @@ class RealtimeCover:
                     loop_cov = self._apply_stems(loop_full)    # apply the current stem mute/solo
                     self.loop_locked = True
                     self._link_anchor = None                   # re-align to Link on the new loop's first push
+                    prev_ph = -1; evolve_mark = -1             # fresh phase tracking + evolve counter
                     continue
                 # NOT locked: stay SILENT (listening) and keep trying to lock — we NEVER fall into the
                 # old continuous-generation fallback. That fallback ran the model every tick and its

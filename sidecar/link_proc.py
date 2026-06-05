@@ -12,7 +12,9 @@ monotonic clock. Arg: quantum (beats per bar, default 4). Exits cleanly if aalin
 the pipe closes."""
 import asyncio
 import json
+import os
 import sys
+import threading
 import time
 
 
@@ -21,7 +23,36 @@ async def _run(quantum):
     link = Link(120.0)
     link.enabled = True
     link.quantum = quantum
-    link.start_stop_sync_enabled = True
+    link.start_stop_sync_enabled = True            # broadcast transport start/stop to peers (Ableton)
+    loop = asyncio.get_running_loop()
+
+    # TRANSPORT COMMANDS from the sidecar over stdin ("play"/"stop"). We're the transport master:
+    # play -> Ableton starts, stop -> Ableton stops (when its Link Start/Stop Sync is enabled). The
+    # Link object lives on this loop, so apply the setter via call_soon_threadsafe from the reader.
+    def _apply(cmd):
+        try:
+            if cmd == "play":
+                link.playing = True
+            elif cmd == "stop":
+                link.playing = False
+            if os.environ.get("ACE15_LIVE_LOG") == "1":
+                try:
+                    with open("/tmp/ace15_link.log", "a") as _f:
+                        _f.write(f"link_proc: {cmd} -> playing={link.playing} peers={link.num_peers}\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _stdin_reader():
+        for line in sys.stdin:                     # blocking line reads on a daemon thread
+            cmd = line.strip().lower()
+            if cmd in ("play", "stop"):
+                loop.call_soon_threadsafe(_apply, cmd)
+            elif cmd == "quit":
+                break
+    threading.Thread(target=_stdin_reader, daemon=True).start()
+
     out = sys.stdout
     period = 1.0 / 60.0
     while True:

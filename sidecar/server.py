@@ -352,6 +352,14 @@ class Connection:
                                   bpm=msg.get("bpm"), key=msg.get("key"))
                 self._in_sr = int(msg.get("sr", SR)); self._in_active = True; self._live_gen = True
                 self.rc.start(); self.playing = True
+                if os.environ.get("ACE15_LIVE_LOG") == "1":
+                    try:
+                        with open("/tmp/ace15_link.log", "a") as _f:
+                            _f.write(f"live_start: link={'set' if self._link is not None else 'None'} -> sending play\n")
+                    except Exception:
+                        pass
+                if self._link is not None:
+                    self._link.set_playing(True)      # we're transport master: start Ableton as we begin listening
                 if not self._stats_on:
                     self._stats_on = True
                     threading.Thread(target=self._stats_loop, daemon=True).start()
@@ -361,6 +369,8 @@ class Connection:
                 # (live_start reuses this engine when the model matches). Frees the GPU only on
                 # a model switch / file-mode switch (handled in live_start / load).
                 self._live_gen = False; self._in_active = False; self.playing = False
+                if self._link is not None:
+                    self._link.set_playing(False)     # stop Ableton's transport with us
                 if self.rc is not None:
                     try: self.rc.stop()
                     except Exception: pass
@@ -405,6 +415,8 @@ class Connection:
                 self.rc.set_input_gain(float(msg["value"]))   # source trim into the model (re-encode)
             elif cmd == "stems":
                 self.rc.set_stems(msg.get("value"))   # live source separation (e.g. ["drums"])
+            elif cmd == "sep_bypass":
+                self.rc.set_sep_bypass(bool(msg.get("value")))   # skip Demucs, output raw full mix (A/B quality)
             elif cmd == "loop_bars":
                 self.rc.set_loop_bars(float(msg.get("value", 0) or 0))   # manual loop length (0 = auto)
             elif cmd == "loop_lead":

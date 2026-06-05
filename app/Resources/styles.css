@@ -204,8 +204,9 @@ body.live-mode .source { cursor: default; }
 .syncval { min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
 /* AI output stem mixer (4 groups × mute/solo). */
 .stemmix { display: flex; flex-direction: column; gap: 5px; }
-.stemmix-hd { font-size: 11px; color: var(--muted); }
+.stemmix-hd { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .stemg { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.stemmix.sep-bypassed .stemg { opacity: 0.35; pointer-events: none; }   /* M/S inert while separation is bypassed */
 .stemg-name { width: 56px; color: var(--fg); }
 .stembtn {
   width: 22px; height: 20px; border-radius: 3px; padding: 0;

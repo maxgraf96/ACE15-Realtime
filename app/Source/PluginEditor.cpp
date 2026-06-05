@@ -65,6 +65,10 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
           {
               processor.setDcw((bool) args[0]); completion({});
           })
+          .withNativeFunction("setSepBypass", [this](auto args, auto completion)
+          {
+              processor.setSepBypass((bool) args[0]); completion({});
+          })
           .withNativeFunction("seek", [this](auto args, auto completion)
           {
               processor.seek((double) args[0]); completion({});
@@ -122,7 +126,7 @@ ACE15Editor::ACE15Editor(ACE15Processor& p)
     addAndMakeVisible(webView);
     webView.goToURL(juce::String(kOrigin) + "/index.html");
     setResizable(true, true);
-    setSize(960, 600);
+    setSize(960, 720);
 }
 
 ACE15Editor::~ACE15Editor() { processor.onEngineEvent = nullptr; }

@@ -22,6 +22,7 @@ const setDenoise  = nf("setDenoise");
 const setChar     = nf("setCharacter");
 const setEvolve   = nf("setEvolve");
 const setDcw      = nf("setDcw");
+const setSepBypass = nf("setSepBypass");
 const seekFn      = nf("seek");
 const reconfigure = nf("reconfigure");
 const setModel    = nf("setModel");
@@ -219,6 +220,18 @@ dcwEl.addEventListener("click", () => {
   dcwEl.classList.toggle("one-shot", dcw);
   setDcw(dcw);                              // updates native state (+ live regen if running)
   if (!started() && styled) applyStyle();  // not running: rebuild the handle in the new DCW state
+});
+
+// Stem-separation bypass: output the raw full mix (no Demucs), regardless of mute/solo. For
+// A/B-ing whether separation affects audio quality. Greys out the stem buttons while on.
+let sepBypass = false;
+const sepBypassEl = $("sepbypass-toggle"), stemmixEl = $("stemmix");
+sepBypassEl.addEventListener("click", () => {
+  sepBypass = !sepBypass;
+  sepBypassEl.textContent = sepBypass ? "Separation: Bypassed" : "Separation: On";
+  sepBypassEl.classList.toggle("one-shot", sepBypass);
+  if (stemmixEl) stemmixEl.classList.toggle("sep-bypassed", sepBypass);   // dim M/S to show they're inert
+  setSepBypass(sepBypass);
 });
 
 // Match tempo/key toggles (inject the bpm/key from the editable fields into the
@@ -498,3 +511,4 @@ window.__JUCE__.backend.addEventListener("engineEvent", (ev) => {
 errDismiss.addEventListener("click", () => errBanner.hidden = true);
 
 setStatus("drop a track");
+setSourceMode(true);   // DEFAULT to Live mode on launch (sets body.live-mode, engine flag, status)

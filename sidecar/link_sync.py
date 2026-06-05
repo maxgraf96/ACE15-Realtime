@@ -35,8 +35,8 @@ class LinkSync:
         try:
             self._proc = subprocess.Popen(
                 [sys.executable, proc_path, str(self._quantum)],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                env=dict(os.environ))
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1, env=dict(os.environ))
         except Exception:
             return
         try:
@@ -110,6 +110,18 @@ class LinkSync:
             return None
         return {"peers": int(c[3]), "tempo": float(c[1]), "beat": float(c[0]),
                 "phase": float(c[2]), "quantum": self._quantum, "playing": bool(c[4])}
+
+    def set_playing(self, playing):
+        """Drive the shared Link transport: play -> Ableton starts, stop -> Ableton stops (if its Link
+        Start/Stop Sync is on). Sent to link_proc over stdin; safe no-op if the reader isn't up yet."""
+        p = self._proc
+        if p is None or p.stdin is None:
+            return
+        try:
+            p.stdin.write(("play" if playing else "stop") + "\n")
+            p.stdin.flush()
+        except Exception:
+            pass
 
     def set_quantum(self, quantum):
         self._quantum = float(quantum)   # used by phase extrapolation (the subprocess set 4/4 at spawn)
