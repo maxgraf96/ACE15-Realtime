@@ -11,7 +11,9 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 # does NOT propagate to the spawned child, so the old sidecar (possibly pre-fix code,
 # still holding the model + the port) survives and the next launch would reconnect to
 # it instead of spawning fresh. Reap it so every launch runs the current code.
-STALE="$(pgrep -f "$ROOT/sidecar/server.py" || true)"
+# (also the Ableton Link reader subprocess, which holds a network port).
+STALE="$(pgrep -f "$ROOT/sidecar/server.py" || true) $(pgrep -f "$ROOT/sidecar/link_proc.py" || true)"
+STALE="$(echo $STALE | xargs)"
 if [ -n "$STALE" ]; then
   echo "Reaping orphaned sidecar(s): $STALE"
   kill $STALE 2>/dev/null || true

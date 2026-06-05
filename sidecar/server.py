@@ -43,6 +43,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine import mps_compat  # noqa: E402
 mps_compat.force_bf16_on_mps()  # bf16 for the XL "Quality" model (no-op for 2B)
 from engine.realtime import RealtimeCover, SR  # noqa: E402
+try:                                            # Ableton Link (out-of-process aalink reader); optional
+    from sidecar.link_sync import get_link  # noqa: E402
+except Exception:
+    try:
+        from link_sync import get_link  # noqa: E402
+    except Exception:
+        get_link = None
 
 MODELS = {"fast": "acestep-v15-turbo", "quality": "acestep-v15-xl-turbo"}
 
@@ -97,9 +104,14 @@ class Connection:
         self._in_since_evt = 0
         self._live_gen = False            # Phase B: route 0x04 into the live engine (feed_input)
         self._live_rc_model = None        # model of the kept-alive live engine (None = no reusable live rc)
+        self._link = None                 # shared Ableton Link reader (LinkSync); None until started
+        self._link_on = False             # link reader + status loop started
 
     def handle(self):
         threading.Thread(target=self._sender, daemon=True).start()
+        self._ensure_link()      # start the Ableton Link reader on connect so the pill shows at launch
+        #                          (entering Live sends no command; input only starts on Play) — UI-only
+        #                          until a live loop locks, then the cover rides Link's grid.
         try:
             while self.alive:
                 frame = _recv_frame(self.sock)
@@ -118,6 +130,44 @@ class Connection:
             _send_json(self.sock, T_EVENT, obj)
         except OSError:
             pass
+
+    def _ensure_link(self):
+        """Start the Ableton Link reader (out-of-process aalink) + a ~2 Hz status-event loop, ONCE.
+        Safe no-op if aalink/link_sync is unavailable — the UI Link pill just stays hidden and the
+        engine uses its onset-anchored fallback. The reader is created INSIDE the loop thread because
+        LinkSync.__init__ blocks up to ~5 s for its first sample — doing it on the control thread would
+        stall the sidecar exactly when the user enters Live."""
+        if self._link_on or get_link is None:
+            return
+        self._link_on = True
+        threading.Thread(target=self._link_loop, daemon=True).start()
+
+    def _link_loop(self):
+        """Emit a 'link' event to the UI whenever availability / peer-connection / tempo changes
+        (~2 Hz). The engine reads beat/phase straight off the shared reader, so this is UI-only."""
+        try:
+            self._link = get_link()                       # process-wide singleton reader (may block ~5 s)
+        except Exception:
+            self._link = None
+            return
+        last = None
+        while self.alive:
+            lk = self._link
+            if lk is not None:
+                # Hand the reader to the live engine once it's ready (the reader may come up AFTER
+                # live_start, and the engine may be recreated on a model switch) so the cover gets
+                # placed on the Link grid without needing a restart.
+                if self.rc is not None and getattr(self.rc, "live", False) and self.rc.link is not lk:
+                    self.rc.link = lk
+                avail = bool(lk.available)
+                conn = bool(lk.connected) if avail else False
+                tempo = float(lk.tempo or 0.0) if avail else 0.0
+                key = (avail, conn, round(tempo))         # don't spam on sub-BPM tempo jitter
+                if key != last:
+                    last = key
+                    self._send_event({"event": "link", "available": avail, "connected": conn,
+                                      "tempo": tempo, "peers": (lk.peers if avail else 0)})
+            time.sleep(0.5)
 
     def _stats_loop(self):
         """Push engine telemetry (buffer / regens / playhead) ~10 Hz while the producer
@@ -253,6 +303,7 @@ class Connection:
             elif cmd == "input_start":
                 self._in_raw = []; self._in_host_frames = 0; self._in_since_evt = 0
                 self._in_active = True
+                self._ensure_link()                       # surface the Link pill as soon as we're live
                 self._send_event({"event": "input_started", "sr": self._in_sr})
             elif cmd == "input_stop":
                 self._in_active = False
@@ -282,6 +333,8 @@ class Connection:
                                             lookahead_s=msg.get("lookahead", 2.0), config_path=cfg)
                     self._live_rc_model = model
                 self.rc.begin_live()
+                self._ensure_link()                       # Ableton Link reader (no-op if already up)
+                self.rc.link = self._link                 # engine places the cover on Link's grid when a peer is present
                 # DEFAULT to a 4-bar hint when the field is blank. Auto-detect (hint 0) can fail to lock
                 # on some loops and then the engine sits in the LISTENING state, which leaks memory until
                 # it OOM-crashes. A hint makes it lock in ~1 loop (the locked path is leak-free). The user

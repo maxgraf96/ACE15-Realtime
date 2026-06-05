@@ -86,6 +86,12 @@ class RealtimeCover:
         self._restyle_pending = False  # a new Style/loop change arrived during a bg re-render
         self._restem = False           # stem mute/solo changed -> re-separate the locked loop cover
         self._pending_stems = None     # bg stem re-separation result handed back to the producer
+        # Ableton Link (set by the sidecar to a LinkSync; None = Link off). When a peer is present we
+        # place the loop cover on Link's BEAT GRID (the shared Ableton clock) instead of the input
+        # onset/fed-sample phase -> drift-free against the DAW. Falls back to onset phase if no peer.
+        self.link = None
+        self.link_active = False       # telemetry: currently placing the cover on the Link grid
+        self._link_anchor = None       # (link_beat0, cover_phase0, loop_P, loop_bars) alignment snapshot
         self._bar_trail_s = 0.0        # achieved output trailing (whole bars) in live mode
         self._running = False
         self._done = False
@@ -190,7 +196,7 @@ class RealtimeCover:
                 "worst_regen_ms": round(self.max_step_ms), "underruns": self.underruns,
                 "progress": pos / dur, "duration_s": round(dur, 1),
                 "loop_locked": bool(self.loop_locked), "loop_bars": int(self.loop_bars),
-                "restyling": bool(self.restyling)}
+                "restyling": bool(self.restyling), "link_active": bool(self.link_active)}
 
     # ---- consumer (audio thread) ----
     def read(self, n):
@@ -376,6 +382,38 @@ class RealtimeCover:
         cov = cov.detach().t().contiguous().cpu().float().numpy()                  # [period_s, 2]
         org = loop[:, :period_s].detach().t().contiguous().cpu().float().numpy()   # the onset-aligned input loop
         return cov, org
+
+    def _cover_phase(self, fed_s, onset, loop_P, ahead_samp):
+        """Sample-phase into the loop cover for the NEXT push. `ahead_samp` = ring + lead frames, i.e.
+        look ahead to the moment this audio will actually PLAY.
+
+        LINK GRID (an Ableton Link peer is present): the cover is `loop_bars` bars long, so one beat =
+        loop_P / (loop_bars * beats_per_bar) samples. We snapshot the current cover phase against the
+        current Link beat ONCE (so the cover stays where the input had it), then advance phase purely
+        from Link's beat -> the cover rides Ableton's shared clock and never drifts against the DAW,
+        regardless of input-stream jitter.
+
+        FALLBACK (no peer): the original onset/fed-sample phase."""
+        if loop_P <= 0:
+            self.link_active = False
+            return 0
+        link = self.link
+        if link is not None and getattr(link, "connected", False):
+            b = link.beat
+            if b is not None:
+                bars = max(1, int(round(self.loop_bars))) if self.loop_bars else 1
+                spb = loop_P / (bars * self.beats_per_bar)             # samples per beat
+                tempo = link.tempo or 120.0
+                if self._link_anchor is None or self._link_anchor[2] != loop_P:
+                    ph0 = ((fed_s - onset) % loop_P) if onset >= 0 else 0   # align cover-now to Link-now
+                    self._link_anchor = (b, ph0, loop_P, bars)
+                b0, ph0, _lp, _bars = self._link_anchor
+                fut = b + (ahead_samp / SR) * (tempo / 60.0)          # Link beat at the PLAY moment
+                self.link_active = True
+                return int(round(ph0 + (fut - b0) * spb)) % loop_P
+        self.link_active = False
+        self._link_anchor = None
+        return ((fed_s - onset + ahead_samp) % loop_P) if onset >= 0 else 0
 
     def start(self):
         self._running = True
@@ -699,14 +737,16 @@ class RealtimeCover:
                     Pn, Bn = loop_P, self.loop_bars                        # SAME loop, reuse the locked period
                     if onset >= 0 and (jit._live_raw.shape[1] - onset) >= Pn:
                         _spawn_rerender(_aligned_start(onset, Pn), Pn, Bn)
-                # stream PHASE-LOCKED TO THE ONSET: cover frame i == onset-phase i, so the cover for
-                # onset-phase (now + ring + lead) keeps the AI aligned to the input grid. The ring is
-                # phase-compensated (no added latency); `loop_lead_s` compensates round-trip latency.
+                # stream PHASE-LOCKED. Default: anchor to the input ONSET (cover frame i == onset-phase i).
+                # When Ableton Link has a peer, anchor to LINK'S BEAT GRID instead: snapshot the current
+                # (input) cover phase against the current Link beat once, then advance phase purely from
+                # Link's beat -> the cover rides the DAW's shared clock with no input-vs-DAW drift. Both
+                # compensate the ring (rd) + round-trip latency (lead) by looking ahead to the PLAY moment.
                 tgt = int(2.0 * SR); lead = int(self.loop_lead_s * SR)
                 if ahead < tgt + self.SL * SPF:
                     with self._lock:
                         rd = self._ring_frames
-                    ph = ((fed_s - onset + rd + lead) % loop_P) if onset >= 0 else 0
+                    ph = self._cover_phase(fed_s, onset, loop_P, rd + lead)
                     n = min(self.SL * SPF, loop_P - ph)
                     self._push_np(loop_cov[ph:ph + n], loop_org[ph:ph + n])
                 else:
@@ -762,6 +802,7 @@ class RealtimeCover:
                     loop_full, loop_org, loop_P = locked       # full mix
                     loop_cov = self._apply_stems(loop_full)    # apply the current stem mute/solo
                     self.loop_locked = True
+                    self._link_anchor = None                   # re-align to Link on the new loop's first push
                     continue
                 # NOT locked: stay SILENT (listening) and keep trying to lock — we NEVER fall into the
                 # old continuous-generation fallback. That fallback ran the model every tick and its
