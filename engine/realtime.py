@@ -86,6 +86,7 @@ class RealtimeCover:
         self._restyle_pending = False  # a new Style/loop change arrived during a bg re-render
         self._restem = False           # stem mute/solo changed -> re-separate the locked loop cover
         self._pending_stems = None     # bg stem re-separation result handed back to the producer
+        self._loop_src_cache = None    # (loop, lat, ctx, Pf, period) of the locked loop -> restyle/evolve skip re-encode
         # Ableton Link (set by the sidecar to a LinkSync; None = Link off). When a peer is present we
         # place the loop cover on Link's BEAT GRID (the shared Ableton clock) instead of the input
         # onset/fed-sample phase -> drift-free against the DAW. Falls back to onset phase if no peer.
@@ -251,7 +252,7 @@ class RealtimeCover:
         self.live = True
         self.loop_locked = False; self.loop_bars = 0; self.restyling = False
         self._pending_cover = None; self._rendering = False; self._restyle_pending = False
-        self._restem = False; self._pending_stems = None
+        self._restem = False; self._pending_stems = None; self._loop_src_cache = None
         with self._lock:
             self._ctrl.clear()       # drop stale queued ctrls so a kept-alive engine restarts clean
         self.jit.begin_live()
@@ -314,7 +315,7 @@ class RealtimeCover:
         """Append live 48 kHz input (any thread)."""
         self.jit.feed_live(pcm_48k)
 
-    def _render_loop_cover(self, start_a, period_s, seed):
+    def _render_loop_cover(self, start_a, period_s, seed, reuse_src=False):
         """Render a clean cover of the loop [start_a, start_a+period_s), for LOOP-COVER mode.
         `start_a` is ONSET-ALIGNED (onset + k*period), so cover frame i maps to the loop's
         onset-phase i -> the cover plays phase-locked to the input, no cross-correlation. The
@@ -340,20 +341,33 @@ class RealtimeCover:
         import torchaudio.functional as AF
         from acestep.nodes.types import Audio, Latent
         from acestep.engine.session import PreparedSource
-        with jit._live_lock:
-            if start_a + period_s > jit._live_raw.shape[1]:
+        # SOURCE LATENT + HINTS. On a RESTYLE / EVOLVE of the SAME locked loop the audio is identical —
+        # only the conditioning (text) / seed changes — so REUSE the cached source latent and SKIP the
+        # expensive VAE re-encode + hint extraction. The fresh lock render (reuse_src=False) encodes and
+        # (re)populates the cache; keyed by period so a re-lock at a new length re-encodes.
+        cache = self._loop_src_cache if reuse_src else None
+        if cache is not None and cache[4] == period_s:
+            loop, lat0, ctx0, Pf = cache[0], cache[1], cache[2], cache[3]
+            lat = lat0.clone()                                    # hand the render a FRESH copy so it can't
+            ctx = Latent(tensor=ctx0.tensor.clone())              # corrupt the cached source for the next reuse
+            _rlog(f"REUSE cached src lat={tuple(lat.shape)} Pf={Pf} (skipped VAE encode + hints)")
+        else:
+            with jit._live_lock:
+                if start_a + period_s > jit._live_raw.shape[1]:
+                    return None
+                loop = jit._live_raw[:, start_a: start_a + period_s].contiguous()   # one onset-aligned loop
+            _rlog(f"START period_s={period_s} ({period_s/SR:.2f}s) bpm={jit.bpm} bpb={self.beats_per_bar} steps={jit.steps}")
+            raw3 = torch.cat([loop, loop, loop], 1)                # tile x3 (the loop repeats -> seamless joins)
+            lat = jit.session.encode_audio(Audio(waveform=raw3, sample_rate=SR)).tensor
+            Pf = (lat.shape[1] // 3 // SEM_PATCH) * SEM_PATCH      # encoded frames per loop (multiple of 5)
+            _rlog(f"after encode raw3={tuple(raw3.shape)} lat={tuple(lat.shape)} Pf={Pf}")
+            if Pf < 5:
                 return None
-            loop = jit._live_raw[:, start_a: start_a + period_s].contiguous()   # one onset-aligned loop
-        _rlog(f"START period_s={period_s} ({period_s/SR:.2f}s) bpm={jit.bpm} bpb={self.beats_per_bar} steps={jit.steps}")
-        raw3 = torch.cat([loop, loop, loop], 1)                # tile x3 (the loop repeats -> seamless joins)
-        lat = jit.session.encode_audio(Audio(waveform=raw3, sample_rate=SR)).tensor
-        Pf = (lat.shape[1] // 3 // SEM_PATCH) * SEM_PATCH      # encoded frames per loop (multiple of 5)
-        _rlog(f"after encode raw3={tuple(raw3.shape)} lat={tuple(lat.shape)} Pf={Pf}")
-        if Pf < 5:
-            return None
-        lat = lat[:, :3 * Pf, :].contiguous()
-        ctx = jit.session.extract_hints(Latent(tensor=lat))
-        _rlog("after extract_hints")
+            lat = lat[:, :3 * Pf, :].contiguous()
+            ctx = jit.session.extract_hints(Latent(tensor=lat))
+            _rlog("after extract_hints")
+            # cache PRISTINE clones so neither this render nor a later reuse can mutate the cached source
+            self._loop_src_cache = (loop, lat.clone(), Latent(tensor=ctx.tensor.clone()), Pf, period_s)
         saved_src, saved_handle, saved_tile = jit.source, jit.handle, jit._TILE
         try:
             jit.source = PreparedSource(latent=Latent(tensor=lat), context_latent=ctx)
@@ -626,8 +640,11 @@ class RealtimeCover:
             def work():
                 torch.set_grad_enabled(False)          # grad flag is THREAD-LOCAL; disable in this worker
                 try:
-                    res = self._render_loop_cover(start_a, P, seed)   # re-encodes (Style) internally
-                    if res:
+                    res = self._render_loop_cover(start_a, P, seed, reuse_src=True)   # reuse cached loop latent
+                    # DISCARD-STALE: if a NEWER Style change queued while we were rendering, this cover is
+                    # already out of date -> drop it (don't flash an intermediate style) and let the
+                    # producer fire the pending render with the latest tags. Keeps restyle responsive.
+                    if res and not self._restyle_pending:
                         cov = self._apply_stems(res[0])      # apply current stems in the BG (no main stall)
                         self._pending_cover = (res[0], cov, res[1], P, B)
                 except Exception:
